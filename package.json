@@ -42,6 +42,10 @@
     "id": "dsh-chaoxing",
     "name": "学习通模式",
     "version": "1.0.0",
+    "repo": "YOUR_GITHUB_USERNAME/dsh-chaoxing",
+    "engines": {
+      "dsh": ">=0.2.0"
+    },
     "permissions": "接管浏览器, 注册 Agent 预设, 系统提示词注入, 工具注册",
     "bundle": {
       "patch": "./cordis.patch.yml"
