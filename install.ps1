@@ -9,23 +9,25 @@
 # identical no matter which PowerShell version you use.
 #
 # Usage:
-#   cd D:\System\Documents\deepseek-harness\default-workspace\dsh-chaoxing
+#   cd <this plugin directory>
 #   pwsh -File .\install.ps1          # preferred (PowerShell 7)
 #   powershell -File .\install.ps1    # also works (Windows PowerShell 5.1)
 #
 #   .\install.ps1 -DryRun             # preview only
 #   .\install.ps1 -Rollback <backup>  # restore a backup
+#   .\install.ps1 -ProfileName default  # a profile other than "desktop"
 
 [CmdletBinding()]
 param(
     [switch]$DryRun,
-    [string]$Rollback
+    [string]$Rollback,
+    [string]$ProfileName = 'desktop'
 )
 
 $ErrorActionPreference = 'Stop'
 
 $PluginDir  = $PSScriptRoot
-$ProfileDir = Join-Path $env:USERPROFILE '.dsh\profiles\desktop'
+$ProfileDir = Join-Path $env:USERPROFILE ".dsh\profiles\$ProfileName"
 $PkgPath    = Join-Path $ProfileDir 'package.json'
 $NodeExe    = Join-Path $env:USERPROFILE '.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe'
 $PnpmMjs    = Join-Path $env:USERPROFILE '.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\pnpm\bin\pnpm.mjs'

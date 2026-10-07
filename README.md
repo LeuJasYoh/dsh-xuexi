@@ -175,7 +175,7 @@
 
 ```powershell
 # 1) 把插件放到任意目录（下面用 D:\plugins\dsh-chaoxing 举例）
-git clone https://github.com/YOUR_GITHUB_USERNAME/dsh-chaoxing.git D:\plugins\dsh-chaoxing
+git clone https://github.com/LeuJasYoh/dsh-chaoxing.git D:\plugins\dsh-chaoxing
 
 # 2) 运行安装脚本（会先备份 profile 的 package.json）
 cd D:\plugins\dsh-chaoxing
@@ -406,7 +406,7 @@ A：**不能直接用。** 工具里的「读」（`lib/observe.mjs`）和「做
 ## 开发
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/dsh-chaoxing.git
+git clone https://github.com/LeuJasYoh/dsh-chaoxing.git
 cd dsh-chaoxing
 node --check index.js
 node --check lib/observe.mjs

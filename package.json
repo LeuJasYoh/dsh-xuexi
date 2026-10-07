@@ -29,12 +29,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/YOUR_GITHUB_USERNAME/dsh-chaoxing.git"
+    "url": "git+https://github.com/LeuJasYoh/dsh-chaoxing.git"
   },
   "bugs": {
-    "url": "https://github.com/YOUR_GITHUB_USERNAME/dsh-chaoxing/issues"
+    "url": "https://github.com/LeuJasYoh/dsh-chaoxing/issues"
   },
-  "homepage": "https://github.com/YOUR_GITHUB_USERNAME/dsh-chaoxing#readme",
+  "homepage": "https://github.com/LeuJasYoh/dsh-chaoxing#readme",
   "engines": {
     "node": ">=20"
   },
@@ -42,7 +42,7 @@
     "id": "dsh-chaoxing",
     "name": "学习通模式",
     "version": "1.0.0",
-    "repo": "YOUR_GITHUB_USERNAME/dsh-chaoxing",
+    "repo": "LeuJasYoh/dsh-chaoxing",
     "engines": {
       "dsh": ">=0.2.0"
     },
