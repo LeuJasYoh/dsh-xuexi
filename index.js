@@ -76,8 +76,18 @@ async function getTree(work, course, { force = false, maxAgeMs = 30 * 60_000 } =
 
 async function getWork(ctx, { relaunch = false } = {}) {
   if (!relaunch && session.browser && session.work) {
-    try { await listPages(session.browser); return session.work }
-    catch { session.browser = null; session.work = null }
+    try {
+      await listPages(session.browser)
+      // ⚠️ 光确认"浏览器还在"不够 —— 浏览器活着**不代表页面会话没死**。
+      //
+      //    实测事故：CDP session 失效后 listPages 照样成功（它是浏览器级命令），
+      //    于是每次都把同一个**死句柄**返回出去，每一条命令都报
+      //    "Session with given id not found"，连 cx_open 都救不回来。
+      //
+      //    现在多做一次页面级存活探测：底层会顺手重连一次，重连还失败才重建句柄。
+      if (await session.work.alive()) return session.work
+      session.work = null
+    } catch { session.browser = null; session.work = null }
   }
   const state = ST.loadState()
   const browser = await launchBrowser({
@@ -129,6 +139,40 @@ async function takeShot(work, { full = false, label = 'shot', clip = null } = {}
   const file = `${dir}\\chaoxing-${safe}-${stamp}.png`
   writeFileSync(file, buf)
   return { file, bytes: buf.length }
+}
+
+/**
+ * 把返回值清洗成「无损 JSON」。
+ *
+ * 为什么必须有：DSH 会校验工具返回值能否**无损**转成 JSON，不能就整个调用失败，
+ * 报 `tool "cx_xxx" returned invalid output: value is not lossless JSON`。
+ *
+ * JS 里有一堆东西 JSON 表达不了：`undefined`、`NaN`、`Infinity`、函数、Symbol、BigInt、Date…
+ * 只要返回对象里**任何一个字段**踩到，整条工具调用就废了 ——
+ * 实测事故里 `remaining: undefined` 就是这么把 cx_courses 彻底打死的。
+ *
+ * 与其逐个字段去防，不如在出口统一清洗一次。
+ */
+function toLossless(v, seen = new Set()) {
+  if (v === null || v === undefined) return null
+  const t = typeof v
+  if (t === 'string' || t === 'boolean') return v
+  if (t === 'number') return Number.isFinite(v) ? v : null
+  if (t === 'bigint') return v.toString()
+  if (t === 'function' || t === 'symbol') return null
+  if (v instanceof Date) return v.toISOString()
+  if (Buffer.isBuffer?.(v)) return `[Buffer ${v.length} B]`
+  if (t === 'object') {
+    if (seen.has(v)) return '[循环引用]'
+    seen.add(v)
+    try {
+      if (Array.isArray(v)) return v.map((x) => toLossless(x, seen))
+      const out = {}
+      for (const [k, x] of Object.entries(v)) out[k] = toLossless(x, seen)
+      return out
+    } finally { seen.delete(v) }
+  }
+  return String(v)
 }
 
 export function apply(ctx, config = {}) {
@@ -232,7 +276,9 @@ export function apply(ctx, config = {}) {
       const denied = commanderGuard(def, exec)
       if (denied) return denied
       if (def.name === 'cx_open') fallbackOwner = exec?.agent?.id ?? fallbackOwner
-      return def.execute(args, exec)
+      // ★ 出口统一清洗：任何 undefined / NaN / Infinity / 函数 都会让
+      //   DSH 判 "value is not lossless JSON" 而整条失败，这里一次性兜住。
+      return toLossless(await def.execute(args, exec))
     },
   }))
 
@@ -272,7 +318,14 @@ export function apply(ctx, config = {}) {
         ok: true, listLoad: load,
         courses: courses.map((c) => ({
           name: c.name, teacher: c.teacher, courseId: c.courseId, clazzId: c.clazzId,
-          done: c.done, total: c.total, percent: c.percent, remaining: c.remaining,
+          done: c.done, total: c.total, percent: c.percent,
+          // ⚠️ 这行原来写的是 `remaining: c.remaining`，但 readCourseList 根本不返回
+          //    这个字段 → 值是 undefined → DSH 直接拒绝：
+          //    "tool cx_courses returned invalid output: value is not lossless JSON"。
+          //    实测事故里这就是第一块倒下的多米诺骨牌（连课程都列不出来）。
+          remaining: (typeof c.total === 'number' && typeof c.done === 'number')
+            ? Math.max(0, c.total - c.done)
+            : null,
         })),
       }
     },
