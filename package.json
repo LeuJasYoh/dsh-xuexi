@@ -1,0 +1,50 @@
+{
+  "name": "dsh-chaoxing",
+  "version": "1.0.0",
+  "description": "DSH 学习通模式：让大模型当司令、脚本当手，在学习通里按真实学习的方式完成课程任务点（原速 / 不拖拽 / 不伪造心跳）",
+  "type": "module",
+  "license": "MIT",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "prompts",
+    "lib",
+    "docs"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "agent-preset",
+    "chaoxing",
+    "xuexitong",
+    "browser-automation",
+    "cdp",
+    "llm-agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YOUR_GITHUB_USERNAME/dsh-chaoxing.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YOUR_GITHUB_USERNAME/dsh-chaoxing/issues"
+  },
+  "homepage": "https://github.com/YOUR_GITHUB_USERNAME/dsh-chaoxing#readme",
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "id": "dsh-chaoxing",
+    "name": "学习通模式",
+    "version": "1.0.0",
+    "permissions": "接管浏览器, 注册 Agent 预设, 系统提示词注入, 工具注册",
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

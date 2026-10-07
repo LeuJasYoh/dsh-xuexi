@@ -1,0 +1,25 @@
+# 行尾规范
+#
+# 默认全部按 LF 存进仓库，检出时由 Git 自己决定。
+# 这样 Windows / macOS / Linux 三边协作不会因为 CRLF 产生假 diff。
+
+* text=auto eol=lf
+
+# PowerShell 脚本在 Windows 上习惯用 CRLF（PS 5.1 对此更友好）
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+
+# 锁文件与压缩产物不参与 diff 统计
+pnpm-lock.yaml -diff linguist-generated
+package-lock.json -diff linguist-generated
+yarn.lock -diff linguist-generated
