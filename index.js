@@ -768,9 +768,10 @@ export function apply(ctx, config = {}) {
 
   reg({
     name: 'cx_shot',
-    description: '给当前页面截图，返回 PNG 路径（DSH 会自动显示图片）。截图落在**当前工作区**的 .chaoxing/shots/ 里。' +
+    description: '给当前页面截图。**图会直接放在返回里 —— 你确实能看到它**，不是只给路径。' +
+      '同时落一份文件到当前工作区的 .chaoxing/shots/。\n' +
       '⚠️ 学习通按页面类型做反扒混淆（独立作业页连**选项**都会乱码），所以 DOM 里的中文一律不可信 —— ' +
-      '**要读懂题目文字（题干和选项）必须用截图**。',
+      '**要读懂题目文字（题干和选项）必须看图**。看不清就用 clip 只截那一块，清晰得多。',
     parameters: {
       type: 'object',
       properties: {
