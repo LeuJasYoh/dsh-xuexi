@@ -168,6 +168,30 @@ async function takeShot(ctx, work, { full = false, label = 'shot', clip = null }
 
 // ═════════════════════════════════════════════════════════════════════════════
 
+/**
+ * 「定位」的 JSON Schema —— 所有要指屏幕上某个东西的参数都用它。
+ *
+ * ⚠️ 必须给足 `properties`：DSH 注册工具时会校验参数 schema，
+ *    光写 `type: 'object'` 不给 `properties` 会注册失败 → 整个预设「加载失败」。
+ *    （实测踩过：2.0.0 第一次装机就是这样卡住的。）
+ *
+ * 三种写法，三选一：编号 i / 可见文字 text / 当前屏幕坐标 x,y。
+ * **不允许出现题号、题型、课程名、章节号** —— 那些是脑子里的概念，屏幕上没有。
+ */
+const LOCATOR_SCHEMA = {
+  type: 'object',
+  description: '定位屏幕上的一个东西，三种写法三选一：{"i":"编号"} / {"text":"可见文字"} / {"x":123,"y":456}',
+  properties: {
+    i: { type: 'string', description: '工具给的编号（最稳，原样照抄）' },
+    text: { type: 'string', description: '屏幕上看得见的文字' },
+    exact: { type: 'boolean', description: 'text 是否要求完全相等（默认包含）' },
+    frame: { type: 'string', description: '文字在哪个窗口（多窗口同名时必须给）' },
+    x: { type: 'number', description: '当前屏幕坐标 X' },
+    y: { type: 'number', description: '当前屏幕坐标 Y' },
+  },
+  additionalProperties: false,
+}
+
 export function apply(ctx, config = {}) {
   const port = config.port ?? DEFAULT_PORT
 
@@ -537,10 +561,7 @@ export function apply(ctx, config = {}) {
           type: 'array', items: { type: 'number' },
           description: '哪几处不是要答的题（比如一个无关的勾选框），不用复核。填对账清单的编号 n。',
         },
-        submitButton: {
-          type: 'object',
-          description: '"交"那个按钮的定位 —— 给上它，复核会顺便确认它真的在页面上',
-        },
+        submitButton: LOCATOR_SCHEMA,
       },
       additionalProperties: false,
     },
@@ -642,8 +663,8 @@ export function apply(ctx, config = {}) {
     parameters: {
       type: 'object',
       properties: {
-        area: { type: 'object', description: '哪一处（eye_see 返回的 area，填它的编号或文字）' },
-        choose: { type: 'array', description: '要挑哪几个选项（每个都是一个定位）' },
+        area: LOCATOR_SCHEMA,
+        choose: { type: 'array', items: LOCATOR_SCHEMA, description: '要挑哪几个选项（每个都是一个定位）' },
         mode: { type: 'string', enum: ['set', 'add', 'clear'], description: 'set 覆盖（默认）/ add 追加 / clear 全取消' },
       },
       required: ['area'],
@@ -665,7 +686,7 @@ export function apply(ctx, config = {}) {
     parameters: {
       type: 'object',
       properties: {
-        area: { type: 'object', description: '写到哪一处（eye_see 返回的 area 的编号或文字）' },
+        area: LOCATOR_SCHEMA,
         text: { type: 'string', description: '写什么' },
         mode: { type: 'string', enum: ['replace', 'append'], description: 'replace 覆盖（默认）/ append 接着写' },
       },
@@ -809,7 +830,7 @@ export function apply(ctx, config = {}) {
       properties: {
         confirm: { type: 'boolean', description: '必须为 true —— 这是"我确认交"的明确表态' },
         reviewed: { type: 'string', description: 'eye_check 给的票据 token' },
-        button: { type: 'object', description: '"交"那个按钮的定位' },
+        button: LOCATOR_SCHEMA,
       },
       required: ['confirm', 'reviewed', 'button'],
       additionalProperties: false,
@@ -926,7 +947,11 @@ export function apply(ctx, config = {}) {
     parameters: {
       type: 'object',
       properties: {
-        picks: { type: 'object', description: '{"1":["B"],"2":["对"]} —— 编号 → 你选的标签' },
+        picks: {
+          type: 'object',
+          description: '{"1":["B"],"2":["对"]} —— 键是「从上到下第几处」，值是图上看得见的标签',
+          additionalProperties: { type: 'array', items: { type: 'string' } },
+        },
         uncertain: { type: 'array', items: { type: 'number' }, description: '拿不准的那几处编号（**不要猜**）' },
         round: { type: 'number', description: '第几轮看的（重看之后填 2，可选）' },
         note: { type: 'string', description: '一句话说明（可选）' },

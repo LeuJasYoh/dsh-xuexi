@@ -473,25 +473,52 @@ t('E12 铁律六条还在', () => {
     const inject = Array.isArray(mod.inject) ? mod.inject : []
     const services = {}
     const registered = []
-    if (inject.includes('tools')) services.tools = { register: (def) => registered.push(def.name) }
+    if (inject.includes('tools')) services.tools = { register: (def) => registered.push(def) }
     services.attachments = { saveImage: async () => ({ attachmentId: 'a1', mediaType: 'image/png', bytes: 1 }) }
 
     const ctx = new Proxy(services, {
       get(t, k) {
         if (k === 'get') return (n) => (n in t ? t[n] : undefined)
-        if (k === 'effect') return (fn) => { try { fn() } catch { /* 注册期抛错不该让装载失败 */ } ; return () => {} }
+        // ★ effect 里**故意不吞错**：注册失败就必须让测试红掉。
+        //   （第一版这里 try/catch 了一把，结果参数 schema 写错整个预设「加载失败」，
+        //     测试还是绿的 —— 这种假绿比没有测试更危险。）
+        if (k === 'effect') return (fn) => { fn(); return () => {} }
         if (k === 'logger') return { warn() {} }
         if (!(k in t)) throw new Error(`cannot get property "${String(k)}" without inject`)
         return t[k]
       },
     })
 
+    // 递归检查参数 schema：object 必须给 properties/additionalProperties，array 必须给 items。
+    // DSH 注册工具时会校验，写不全就注册失败 → 整个预设「加载失败」。
+    const bad = []
+    const walkSchema = (node, path) => {
+      if (!node || typeof node !== 'object') return
+      if (Array.isArray(node)) { node.forEach((n, i) => walkSchema(n, `${path}[${i}]`)); return }
+      if (node.type === 'object' && !node.properties && !node.additionalProperties) {
+        bad.push(`${path}: type=object 却没有 properties / additionalProperties`)
+      }
+      if (node.type === 'array' && !node.items) bad.push(`${path}: type=array 却没有 items`)
+      for (const [k, v] of Object.entries(node)) {
+        if (k === 'properties' && v && typeof v === 'object') {
+          for (const [pk, pv] of Object.entries(v)) walkSchema(pv, `${path}.${pk}`)
+        } else if (k === 'items' || k === 'additionalProperties') {
+          walkSchema(v, `${path}.${k}`)
+        }
+      }
+    }
+
     try {
       await mod.apply(ctx, {})
       ta('F1 装载成功（apply 没抛）', true)
-      ta('F2 注册了 15 个工具', registered.length === 15, `实际 ${registered.length}：${registered.join(',')}`)
-      for (const n of TOOLS) ta(`F3 ${n} 真的注册上了`, registered.includes(n))
-      ta('F4 systemPrompt 段落被登记（提示词能进上下文）', true)
+      const names = registered.map((d) => d.name)
+      ta('F2 注册了 15 个工具', registered.length === 15, `实际 ${registered.length}：${names.join(',')}`)
+      for (const n of TOOLS) ta(`F3 ${n} 真的注册上了`, names.includes(n))
+      for (const d of registered) walkSchema(d.parameters, `${d.name}.parameters`)
+      ta('F4 参数 schema 都写全了（object 有 properties、array 有 items）', bad.length === 0,
+        bad.join(' | ') || '')
+      ta('F5 每个工具都有 output.schema + output.render', registered.every((d) => d.output && d.output.schema && typeof d.output.render === 'function'))
+      ta('F6 每个工具都有 execute', registered.every((d) => typeof d.execute === 'function'))
     } catch (e) {
       ta('F1 装载成功（apply 没抛）', false, `apply 抛错：${String(e?.message ?? e)}`)
     }
