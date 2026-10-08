@@ -74,6 +74,46 @@ async function getTree(work, course, { force = false, maxAgeMs = 30 * 60_000 } =
   return tree
 }
 
+/**
+ * 在课程列表里找到指定课程 —— **所有需要课程列表的地方统一走这里**。
+ *
+ * ⚠️ 为什么必须统一（实测事故 2026-10-07 第二次）：
+ *
+ *   课程列表在一个跨域 iframe 里，`goto` 之后**要等它渲染完**（实测约 3.5 秒）。
+ *   `cx_courses` 等了（先 waitForCourseListStable），所以能列出 25 门课；
+ *   而 `cx_chapters` / `cx_enter` 没等 —— 于是**每次读到空列表**，
+ *   报 `COURSE_NOT_FOUND` 且 `available: []`。
+ *
+ *   后果是连锁的：大模型拿不到章节结构，就不知道哪些小节还有任务点，
+ *   只能一节一节 `cx_nav` 翻过去看 —— 而它翻的前几节刚好都已经做完了，
+ *   于是用户看到的就是"一直在翻页、什么都不干"，最后当成卡死中断。
+ *
+ * 顺带修了标题匹配：课程名可能带空格或后缀差异，严格 `===` 太脆，
+ * 现在按「完全相等 → 去空格相等 → 包含」逐级退让。
+ */
+async function resolveCourse(work, name) {
+  await work.goto(OBS.HOME_URL, { timeoutMs: 30_000 })
+  try { await OBS.waitForCourseListStable(work) } catch { /* 拿不到稳定信号也继续试着读 */ }
+
+  let all = await OBS.readCourseList(work).catch(() => [])
+  if (!all.length) {                              // 还空就再给它一点时间
+    await new Promise((r) => setTimeout(r, 2500))
+    all = await OBS.readCourseList(work).catch(() => [])
+  }
+
+  if (!name) return { all, course: all[0] ?? null }
+
+  const norm = (s) => String(s ?? '').replace(/\s+/g, '').trim()
+  const want = norm(name)
+  const course =
+    all.find((c) => c.name === name) ??
+    all.find((c) => norm(c.name) === want) ??
+    all.find((c) => norm(c.name).includes(want)) ??
+    all.find((c) => want.includes(norm(c.name)) && norm(c.name)) ??
+    null
+  return { all, course }
+}
+
 async function getWork(ctx, { relaunch = false } = {}) {
   if (!relaunch && session.browser && session.work) {
     try {
@@ -348,10 +388,20 @@ export function apply(ctx, config = {}) {
       const work = await getWork(ctx)
       if (!(await OBS.isLoggedIn(work))) return { ok: false, error: 'NOT_LOGGED_IN' }
 
-      await work.goto(OBS.HOME_URL, { timeoutMs: 30_000 })
-      const all = await OBS.readCourseList(work)
-      const course = all.find((c) => c.name === courseName)
-      if (!course) return { ok: false, error: 'COURSE_NOT_FOUND', available: all.map((c) => c.name) }
+      // ★ 统一入口：resolveCourse 内部先 goto 再等渲染完
+      //   （旧代码是「goto 完立刻读」→ 课程列表还没渲染 → 读到空 → 整条流程断掉）
+      const { all, course } = await resolveCourse(work, courseName)
+      if (!course) {
+        return {
+          ok: false, error: 'COURSE_NOT_FOUND',
+          searched: courseName ?? '(未指定)',
+          availableCount: all.length,
+          available: all.map((c) => c.name).slice(0, 40),
+          hint: all.length
+            ? '课程列表读到了，但没有匹配的名字 —— 从 available 里挑一个准确的。'
+            : '课程列表是空的。可能还没加载完，或者那个页面没登录。先 cx_courses 看看。',
+        }
+      }
 
       let tree
       try { tree = await getTree(work, course, { force: true }) }
@@ -399,12 +449,21 @@ export function apply(ctx, config = {}) {
       // ── 课程：优先用上次的，避免每次重载课程列表页 ───────────────────────
       let course = session.course
       if (!course || (courseName && course.name !== courseName)) {
-        await work.goto(OBS.HOME_URL, { timeoutMs: 30_000 })
-        const all = await OBS.readCourseList(work)
-        course = courseName
-          ? all.find((c) => c.name === courseName)
-          : (all.find((c) => c.name === session.course?.name) ?? all[0])
-        if (!course) return { ok: false, error: 'COURSE_NOT_FOUND', available: all.map((c) => c.name) }
+        // ★ 统一入口。注意这里**不能**用 `goto(HOME_URL)` + 直读的老写法：
+        //   课程列表要等 3.5 秒才渲染出来，直读只会拿到空数组。
+        const { all, course: hit } = await resolveCourse(work, courseName)
+        course = hit ?? null
+        if (!course) {
+          return {
+            ok: false, error: 'COURSE_NOT_FOUND',
+            searched: courseName ?? '(未指定)',
+            availableCount: all.length,
+            available: all.map((c) => c.name).slice(0, 40),
+            hint: all.length
+              ? '课程列表读到了，但没有匹配的名字 —— 从 available 里挑一个准确的。'
+              : '课程列表是空的。可能还没加载完，或者那个页面没登录。先 cx_courses 看看。',
+          }
+        }
         session.course = course
       }
 
@@ -455,10 +514,28 @@ export function apply(ctx, config = {}) {
       }
 
       if (!section) {
+        const list = flat.map((s, i) => ({
+          i: i + 1, unit: s.unit, title: s.title, chapterId: s.chapterId,
+          badgeRemaining: s.jobCount ?? null,
+        }))
+        // ★ 「没指定要进哪个小节」不是错误 —— 章节树已经成功读到了，
+        //   直接把清单给大模型挑就行。旧代码在这里报 SECTION_NOT_FOUND，
+        //   于是大模型以为"读不到章节"，白跑了两步（实测日志第 18 步）。
+        if (want == null || want === '') {
+          return {
+            ok: true, needSection: true,
+            course: course.name, progress: tree.progress?.raw ?? null,
+            sectionCount: list.length,
+            sections: list,
+            hint: '章节树读到了，但你没说要进哪个小节。从上面挑一个，'
+              + '再调 cx_enter({ chapterId }) —— **优先用 chapterId**，标题可能重名。',
+          }
+        }
         return {
           ok: false, error: 'SECTION_NOT_FOUND',
-          hint: want != null ? `没找到「${want}」` : '请给 section 或 chapterId',
-          sections: flat.map((s, i) => ({ i: i + 1, unit: s.unit, title: s.title, chapterId: s.chapterId })),
+          hint: `没找到「${want}」。下面是小节清单，用 chapterId 精确指定。`,
+          sectionCount: list.length,
+          sections: list,
         }
       }
 
@@ -466,6 +543,16 @@ export function apply(ctx, config = {}) {
       await work.waitFor(`document.querySelectorAll('.chapter_item[id]').length > 0`, { timeoutMs: 20_000 })
       await ACT.enterSection(work, course, section)
       const tabs = await OBS.readTabs(work)
+      // readTabs 在没有 #prev_tab 的页面上会**立刻返回 null**（不再干等 25 秒），
+      // 所以这里必须接住 —— 以前它抛错，现在返回 null，直接 .map 会崩。
+      if (!tabs) {
+        return {
+          ok: false, error: 'NO_TABS_ON_PAGE',
+          url: await work.eval('location.href').catch(() => null),
+          hint: '进了小节，但页面上没有标签条 —— 可能内容还没渲染出来，'
+            + '或者这个"小节"不是学习页。先 cx_page 看 pageKind 是什么，必要时 cx_shot 截图。',
+        }
+      }
 
       session.course = course
       session.section = section
@@ -505,7 +592,23 @@ export function apply(ctx, config = {}) {
     async execute({ all = false } = {}) {
       const work = await getWork(ctx)
       const tabs = await OBS.readTabs(work).catch(() => session.tabs ?? null)
-      if (all) return { ok: true, ...(await inventoryAll(work, { tabs })) }
+      if (all) {
+        if (!tabs) {
+          // 不在小节页上就别报一句干巴巴的 NO_TABS —— 先告诉它人在哪
+          const info = await OBS.detectPageKind(work).catch(() => null)
+          return {
+            ok: false, error: 'NO_TABS_ON_PAGE',
+            pageKind: info?.kind ?? 'UNKNOWN',
+            pageHint: info?.why ?? null,
+            url: info?.href ?? null,
+            hint: info?.kind === 'SECTION'
+              ? '这确实是小节页，但标签条没读到。先 cx_page()（不带 all）看单页情况，必要时 cx_shot 截图。'
+              : '你现在不在小节学习页上，所以没有"整节"可看。'
+                + '先 cx_chapters 找到还有剩余任务点的小节，再用 cx_enter({ chapterId }) 进去。',
+          }
+        }
+        return { ok: true, ...(await inventoryAll(work, { tabs })) }
+      }
       return { ok: true, ...(await inventory(work, { tabs })) }
     },
   })
@@ -594,6 +697,14 @@ export function apply(ctx, config = {}) {
     async execute({ i, cardid } = {}) {
       const work = await getWork(ctx)
       const tabs = await OBS.readTabs(work)
+      if (!tabs) {
+        return {
+          ok: false, error: 'NO_TABS_ON_PAGE',
+          url: await work.eval('location.href').catch(() => null),
+          hint: '当前页面上没有标签条 —— 你可能不在小节学习页上。'
+            + '先 cx_page 看 pageKind；不在 SECTION 就先 cx_enter 进一个小节。',
+        }
+      }
       const tab = cardid ? tabs.find((t) => t.cardid === cardid) : tabs[Number(i)]
       if (!tab) {
         return {

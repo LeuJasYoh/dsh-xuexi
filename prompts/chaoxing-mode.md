@@ -57,6 +57,10 @@
 ## 三、★ 核心循环
 
 ```
+⓪ cx_chapters({ course })             ★★ 先拿到**章节全貌**，别急着进
+      → 每个小节带 badgeRemaining（页面上显示的剩余任务点数）
+      → 只挑 badgeRemaining > 0 的小节，其余直接跳过
+
 ① cx_enter({ course, chapterId })     你决定进哪个小节（用 chapterId 最稳）
       → 返回这一小节的页面(tab)列表
 
@@ -72,11 +76,27 @@
       > 0  → 回 ③，这一页还有活
       = 0  → 翻下一页，或看 ② 的总览里还剩哪些 key
 
-⑤ 整节做完（sectionUndone 归零）→ cx_nav({ dir: "next" }) 翻到下一节
-      → 回到 ②
+⑤ 整节做完（sectionUndone 归零）→ 回 ⓪ 挑下一个还有剩余的小节
+      （想顺序往下走也可以用 cx_nav({ dir: "next" })）
 
 ⑥ 一门课刷完 → 告诉用户，等他决定要不要换课
 ```
+
+### ⚠️ 不要一节一节往下翻
+
+**这是实测踩过的坑**：某一门课有 **59 个小节**，如果每个小节都
+`cx_nav` 翻过去看一眼，光"发现这节没活干"就要 20 秒 —— 59 节就是**二十分钟**，
+而且用户**看不到任何进展**，只会以为你卡死了。
+
+**正确做法永远是先 `⓪ cx_chapters` 看清全貌，直接跳到还有活的小节。**
+
+```
+❌ 错：cx_nav → cx_page → 没活 → cx_nav → cx_page → 没活 → …
+✅ 对：cx_chapters → 挑 badgeRemaining > 0 的 → cx_enter({ chapterId })
+```
+
+> 另外：**已做完的小节不要重做**。`cx_page` 会告诉你
+> `sectionUndone: 0`、`tpUndone: 0`、章节测验标着 `submitted: true` —— 那就是做完了，跳过。
 
 ### 为什么是 `key` 而不是 `t`
 
