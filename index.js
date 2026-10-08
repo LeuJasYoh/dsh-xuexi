@@ -209,35 +209,51 @@ function serial(fn) {
 
 /** 截图存盘 + 注册成附件 —— cx_shot 和 cx_do(read) 共用，避免两处逻辑漂移 */
 async function takeShot(ctx, work, { full = false, label = 'shot', clip = null } = {}) {
-  const buf = clip
-    ? await work.screenshot({ clip })
-    : (full ? await work.screenshotFull() : await work.screenshot())
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-  const safe = String(label).replace(/[^\w.-]+/g, '_')
-  // ★ 截图是**过程文件**，落在工作区的 .chaoxing/shots/ 里，跟这次对话在一起
   const dir = ST.shotsDir()
   mkdirSync(dir, { recursive: true })
-  const file = `${dir}\\chaoxing-${safe}-${stamp}.png`
-  writeFileSync(file, buf)
+  const attachments = ctx.get('attachments')
 
-  // ★★ 关键：把它**当成附件存进 DSH**，这样 objOut.render 才能把它
-  //    渲染成真正的图片块交给模型。只写文件、不给 ref 的话，
-  //    模型看到的永远只是一行路径 —— 那就等于没截图（实测踩过这个坑）。
-  let image = null
-  try {
-    const attachments = ctx.get('attachments')
+  // ★ 把它**当成附件存进 DSH**，这样 objOut.render 才能渲染成真正的图片块。
+  //   只写文件、不给 ref 的话，模型看到的永远只是一行路径 —— 那就等于没截图。
+  //
+  //   ⚠️ 整页 PNG 可能有几 MB，超过附件的尺寸/体积上限就会被拒。
+  //      所以留一条降级路：PNG 存不进去就改用 JPEG 重截一次（体积通常小一个数量级）。
+  const attempt = async (format, quality) => {
+    const buf = clip
+      ? await work.screenshot({ clip, format, quality })
+      : (full ? await work.screenshotFull({ format, quality }) : await work.screenshot({ format, quality }))
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const safe = String(label).replace(/[^\w.-]+/g, '_')
+    const ext = format === 'jpeg' ? 'jpg' : 'png'
+    const file = `${dir}\\chaoxing-${safe}-${stamp}.${ext}`
+    writeFileSync(file, buf)
+
+    let image = null
+    let err = null
     if (attachments?.saveImage) {
-      image = await attachments.saveImage({
-        data: new Uint8Array(buf),
-        mediaType: 'image/png',
-        name: `chaoxing-${safe}.png`,
-      })
+      try {
+        image = await attachments.saveImage({
+          data: new Uint8Array(buf),
+          mediaType: format === 'jpeg' ? 'image/jpeg' : 'image/png',
+          name: `chaoxing-${safe}.${ext}`,
+        })
+      } catch (e) { err = e }
     }
-  } catch (e) {
-    // 存附件失败不该让截图整体失败 —— 路径照样给，调用方会看到 imageUnavailable
-    console.error('[dsh-chaoxing] saveImage 失败:', String(e?.message ?? e))
+    return { file, bytes: buf.length, type: format === 'jpeg' ? 'image/jpeg' : 'image/png', image, err }
   }
-  return { file, bytes: buf.length, image }
+
+  let r = await attempt('png')
+  // 只有当"附件服务在、但拒了这张图"时才降级重截 —— 服务本来就不可用就没什么好重试的
+  if (!r.image && attachments?.saveImage) {
+    const j = await attempt('jpeg', 78).catch(() => null)
+    if (j?.image) {
+      r = { ...j, downscaled: true, note: `整页 PNG（${r.bytes} B）存不进附件，已改用 JPEG` }
+    }
+  }
+
+  const { err, ...rest } = r
+  if (!r.image && err) console.error('[dsh-chaoxing] saveImage 失败:', String(err?.message ?? err))
+  return rest
 }
 
 /**
@@ -664,6 +680,21 @@ export function apply(ctx, config = {}) {
       await work.goto(OBS.chapterListUrl(course), { timeoutMs: 30_000 })
       await work.waitFor(`document.querySelectorAll('.chapter_item[id]').length > 0`, { timeoutMs: 20_000 })
       await ACT.enterSection(work, course, section)
+
+      // ★ 先等标签条**渲染出来**再读。
+      //
+      //   实测（2026-10-08 日志）：这一句不写的话，3 次 cx_enter **全部**
+      //   报 NO_TABS_ON_PAGE —— 因为刚导航进小节，`#prev_tab` 还没生成，
+      //   而 readTabs 在没有它的页面上会立刻返回 null（那是为了首页不干等 25 秒）。
+      //   结果模型每次都得再补一次 cx_page({all:true}) 才能干活，白费一步。
+      //
+      //   这里刚导航过，等一下是**对的**；在首页那种没有标签条的地方，
+      //   readTabs 仍然立刻返回 null，不会再干等。
+      await work.waitFor(
+        `!!document.querySelector('#prev_tab li')`,
+        { timeoutMs: 15_000 },
+      ).catch(() => { /* 等不到也照样往下读，让 readTabs 报 NO_TABS_ON_PAGE */ })
+
       const tabs = await OBS.readTabs(work)
       // readTabs 在没有 #prev_tab 的页面上会**立刻返回 null**（不再干等 25 秒），
       // 所以这里必须接住 —— 以前它抛错，现在返回 null，直接 .map 会崩。
@@ -671,8 +702,8 @@ export function apply(ctx, config = {}) {
         return {
           ok: false, error: 'NO_TABS_ON_PAGE',
           url: await work.eval('location.href').catch(() => null),
-          hint: '进了小节，但页面上没有标签条 —— 可能内容还没渲染出来，'
-            + '或者这个"小节"不是学习页。先 cx_page 看 pageKind 是什么，必要时 cx_shot 截图。',
+          hint: '进了小节，等了 15 秒也没等到标签条 —— 可能这个"小节"不是学习页，'
+            + '或者内容加载失败了。先 cx_page 看 pageKind 是什么，必要时 cx_shot 截图。',
         }
       }
 
