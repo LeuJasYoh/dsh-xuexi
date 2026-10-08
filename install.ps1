@@ -1,4 +1,4 @@
-# install.ps1 -- install dsh-chaoxing into the DSH desktop profile
+# install.ps1 -- install dsh-xuexi into the DSH desktop profile
 #
 # NOTE: This file is intentionally ASCII-only.
 # Windows PowerShell 5.1 reads .ps1 using the system ANSI code page, so any
@@ -97,7 +97,7 @@ if ($DryRun) {
 # it re-resolves the dependency and definitely re-materialises the copy.
 # It leaves the existing version spec in package.json untouched.
 #
-$staleDir = Join-Path $ProfileDir 'node_modules\dsh-chaoxing'
+$staleDir = Join-Path $ProfileDir 'node_modules\dsh-xuexi'
 if (Test-Path $staleDir) {
     Write-Host "[..] removing stale installed copy: $staleDir"
     Remove-Item $staleDir -Recurse -Force
@@ -107,7 +107,7 @@ if (Test-Path $staleDir) {
 }
 
 # ---- 4) link via `pnpm add` ------------------------------------------------
-$linkSpec = "dsh-chaoxing@file:$($PluginDir -replace '\\','/')"
+$linkSpec = "dsh-xuexi@file:$($PluginDir -replace '\\','/')"
 Write-Host ""
 Write-Host "[..] running: pnpm add $linkSpec"
 Push-Location $ProfileDir
@@ -130,7 +130,7 @@ if ($code -ne 0) {
 # Do not trust the exit code: the failure mode above produced exit code 0.
 if (-not (Test-Path $staleDir)) {
     Write-Host ""
-    Write-Host "[FAIL] node_modules\dsh-chaoxing is still missing after install." -ForegroundColor Red
+    Write-Host "[FAIL] node_modules\dsh-xuexi is still missing after install." -ForegroundColor Red
     Write-Host "       Try manually: cd `"$ProfileDir`"; pnpm add `"$linkSpec`""
     throw "installed copy missing"
 }
@@ -145,7 +145,7 @@ Write-Host "  1. Restart DeepSeek Harness."
 Write-Host "  2. Open Settings -> 'Agent preset' section (NOT a top dropdown)."
 Write-Host "     The new mode appears under the CUSTOM group."
 Write-Host "  3. If the new-task selector is missing, turn on General -> coding tools."
-Write-Host "  4. Pick the Xuexitong mode, then say: take over the browser first"
+Write-Host "  4. Pick the 'Wangke (online-course)' mode, then say: take over the browser first"
 Write-Host ""
 Write-Host "Rollback:"
 Write-Host "  .\install.ps1 -Rollback `"$backup`""

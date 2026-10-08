@@ -1,31 +1,31 @@
-# dsh-chaoxing bundle 补丁
+# dsh-xuexi bundle 补丁
 #
-# 只做一件事：注册一个 Agent 预设「学习通模式」。
+# 只做一件事：注册一个 Agent 预设「网课模式」。
 #
 # ⚠️ 重要：插件【只能】挂在预设里面的 `plugins` 列表里，
-#    绝对不要再往根作用域另插一条 `include: dsh-chaoxing`。否则：
-#      1. 标准模式等其它模式里也会冒出 cx_* 工具（用户明确说过不想看到）
-#      2. 插件被挂载两次 → 两个 running 标志、两个浏览器句柄 →
-#         串行闸门失效，而学习通禁止同账号并行刷课
+#    绝对不要再往根作用域另插一条 `include: dsh-xuexi`。否则：
+#      1. 标准模式等其它模式里也会冒出 eye_*/hand_* 工具（用户明确说过不想看到）
+#      2. 插件被挂载两次 → 两个 busy 标志、两个浏览器句柄 → 串行闸门失效，
+#         而同一个账号禁止并行操作
 #
 # 界面位置（客户端的判定逻辑 isBuiltInPreset 要求 preset.name === undefined 才算内置）：
 #   我们这个预设带了 name，所以归入【自定义】分组，
 #   出现在 设置 → 「Agent 预设」 区块里；
 #   新任务选择器则要求 通用设置 → 代码工作工具 打开后才显示。
 #
-# 提示词注入不在这里写：插件 index.js 会读 prompts/chaoxing-mode.md，
-# 通过 ctx.systemPrompt.section 注入——注册继承预设作用域，只在学习通模式生效。
+# 提示词注入不在这里写：插件 index.js 会读 prompts/xuexi-mode.md，
+# 通过 ctx.systemPrompt.section 注入 —— 注册继承预设作用域，只在网课模式生效。
 
 - insert:
-    - id: preset-chaoxing
+    - id: preset-xuexi
       name: '@deepseek-ai/dsh-agent-preset'
       config:
-        id: chaoxing
-        name: 学习通模式
-        description: 接管浏览器，按真实学习方式完成学习通课程任务点（原速 / 不拖拽 / 不伪造心跳）
+        id: xuexi
+        name: 网课模式
+        description: 接管浏览器，按真实学习方式完成网课任务（原速 / 不拖拽 / 不伪造心跳）
         order: 20
         plugins:
-          # 这个模式完整的子插件清单——标准模式的编程工具都不在这里，所以互不干扰
+          # 这个模式完整的子插件清单 —— 标准模式的编程工具都不在这里，所以互不干扰
           #
           # ⚠️ persona 行的两个坑（都踩过，都已修）：
           #   1. `prefix` 是 z.string().required() —— 必填！漏了会导致
@@ -33,17 +33,17 @@
           #   2. 千万不要加 `complete: true`。文档原文：
           #      「complete: true 时，提示词注册表会把这确切前缀恢复为唯一段落；
           #        身份、后缀、工具引导或监听器都无法追加提示词文本。」
-          #      —— 也就是说它会把下面 dsh-chaoxing 注入的 mode 提示词整个抑制掉。
+          #      —— 也就是说它会把下面 dsh-xuexi 注入的 mode 提示词整个抑制掉。
           #
           # 正确组合：给一句短身份（prefix），不开 complete，
-          # 让 dsh-chaoxing 通过 ctx.systemPrompt.section 追加详细规则。
+          # 让 dsh-xuexi 通过 ctx.systemPrompt.section 追加详细规则。
           - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:
-              prefix: 你是学习通课程助手，只负责在浏览器里完成学习通课程任务点。
+              prefix: 你是网课助手：工具是你的手和眼，你负责在浏览器里判断和决定。
               includeRuntimeContext: false
-          - id: chaoxing
-            name: dsh-chaoxing
+          - id: xuexi
+            name: dsh-xuexi
             config:
               port: 9222
 
@@ -51,12 +51,12 @@
           #
           # ⚠️ 为什么要加（实测事故 2026-10-08）：
           #   预设的 `plugins` 列表**就是一个作用域的白名单** ——
-          #   只写 [persona, chaoxing] 的话，这个模式的 Agent 除了 cx_* 之外
+          #   只写 [persona, xuexi] 的话，这个模式的 Agent 除了 eye_*/hand_* 之外
           #   什么工具都没有。实测日志证实：模型拿到的 30 个工具里
           #   **没有 read / write / read_image，也没有 subagent**。
           #
           #   后果有两个，都是用户直接发现的：
-          #     1. 提示词里写的「判题员用 read_image 读图」根本无从执行 ——
+          #     1. 提示词里写的「复核员用 read_image 读图」根本无从执行 ——
           #        工具不存在，模型只能自己看图，体力活没派出去；
           #     2. 模型没法把截图当文件读、也没法自己写笔记文件。
           #

@@ -1,460 +1,461 @@
+/**
+ * test/run.mjs —— 断言集
+ *
+ * 分五组：
+ *   A 参数校验（args.mjs）  —— 格式错必须拦住，且**零副作用**
+ *   B 复核闸门（gate.mjs）  —— 七条 + 票据 + 登记覆盖
+ *   C 工具表面             —— 15 个工具、前缀、并发标志
+ *   D 痕迹检查             —— 代码/提示词里不许有平台字样
+ *   E 预设自检             —— cordis.patch.yml / package.json / 提示词对得上
+ *
+ * 跑法：npm test
+ */
+
+import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
+const read = (p) => readFileSync(join(ROOT, p), 'utf8')
+
+let pass = 0
+const fails = []
+
+function t(name, fn) {
+  try {
+    const r = fn()
+    if (r === false) throw new Error('返回 false')
+    pass++
+  } catch (e) {
+    fails.push(`${name}\n      ${String(e?.message ?? e).split('\n')[0]}`)
+  }
+}
+function ta(name, cond, extra = '') {
+  try {
+    if (!cond) throw new Error(extra || '断言不成立')
+    pass++
+  } catch (e) {
+    fails.push(`${name}\n      ${String(e?.message ?? e).split('\n')[0]}`)
+  }
+}
+const eq = (a, b, msg) => { if (a !== b) throw new Error(`${msg ?? ''} 期望 ${JSON.stringify(b)}，实际 ${JSON.stringify(a)}`) }
+
+const A = await import('../lib/args.mjs')
+const G = await import('../lib/gate.mjs')
+
 // ═══════════════════════════════════════════════════════════════════════════
-// 假 CDP 测试台 —— 在没有真浏览器的情况下**真的跑一遍**选页逻辑
-//
-//   node test/run.mjs
+// A 参数校验
 // ═══════════════════════════════════════════════════════════════════════════
-//
-// 为什么要有它：这个项目已经出过好几次"语法过了、能装载、但真机一跑就错"的事。
-// 「没报错」不等于「对」。所以关键分支必须有能自动跑的验证。
-//
-// 做法：伪造一个 browser 对象，它的 sock.send 按命令名返回预设结果，
-// 然后直接调真实的 ensureWorkTab / 真实的 output.render，断言结果。
 
-import assert from 'node:assert/strict'
-import fs from 'node:fs'
-import path from 'node:path'
+t('A1 定位都不给 → ARG', () => {
+  const r = A.checkArgs('hand_click', {})
+  eq(r.ok, false); eq(r.category, 'ARG')
+})
+t('A2 定位混着给 → ARG', () => {
+  const r = A.checkArgs('hand_click', { i: 'r1', x: 1, y: 2 })
+  eq(r.ok, false); eq(r.category, 'ARG')
+})
+t('A3 业务概念（题号）→ ARG，且话说明白', () => {
+  const r = A.checkArgs('hand_click', { 题号: 1 })
+  eq(r.ok, false); eq(r.category, 'ARG')
+  ta('A3b 提示里点出这个键', r.error.includes('题号'), r.error)
+})
+t('A4 坐标不是数字 → ARG', () => {
+  eq(A.checkArgs('hand_click', { x: 'a', y: 2 }).ok, false)
+  eq(A.checkArgs('hand_click', { x: NaN, y: 2 }).ok, false)
+})
+t('A5 text 定位通过', () => {
+  const r = A.checkArgs('hand_click', { text: '提交' })
+  eq(r.ok, true); eq(r.args.loc.text, '提交')
+})
+t('A6 settleMs 超范围 → ARG', () => eq(A.checkArgs('hand_click', { i: 'r1', settleMs: 99999 }).ok, false))
+t('A7 eye_shot: full 和 clip 不能同时给', () => {
+  const r = A.checkArgs('eye_shot', { full: true, clip: { x: 0, y: 0, width: 10, height: 10 } })
+  eq(r.ok, false); eq(r.category, 'ARG')
+})
+t('A8 eye_shot: clip 宽高必须 > 0', () => eq(A.checkArgs('eye_shot', { clip: { x: 0, y: 0, width: 0, height: 10 } }).ok, false))
+t('A9 eye_shot 正常', () => eq(A.checkArgs('eye_shot', {}).args.full, false))
 
-const HERE = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
-const PLUGIN = path.resolve(HERE, '..')
-
-let pass = 0, fail = 0
-const t = (name, fn) => {
-  try { fn(); console.log('  ✅ ' + name); pass++ }
-  catch (e) { console.log('  ❌ ' + name + '\n       ' + String(e.message).split('\n').slice(0, 6).join('\n       ')); fail++ }
-}
-const ta = async (name, fn) => {
-  try { await fn(); console.log('  ✅ ' + name); pass++ }
-  catch (e) { console.log('  ❌ ' + name + '\n       ' + String(e.message).split('\n').slice(0, 6).join('\n       ')); fail++ }
-}
-
-// ── 伪造浏览器 ──────────────────────────────────────────────────────────────
-// pages: [{ targetId, url, visible }]
-function fakeBrowser(pages) {
-  const calls = []
-  const sessions = new Map()          // sessionId -> targetId
-  let nextSid = 0
-  const visibleOf = (targetId) => !!pages.find((p) => p.targetId === targetId)?.visible
-
-  const sock = {
-    calls,
-    async send(method, params = {}, sessionId) {
-      calls.push({ method, params, sessionId })
-      switch (method) {
-        case 'Target.getTargets':
-          return { targetInfos: pages.map((p) => ({ targetId: p.targetId, type: 'page', url: p.url, title: '' })) }
-        case 'Target.attachToTarget': {
-          const sid = 'sid-' + (++nextSid)
-          sessions.set(sid, params.targetId)
-          return { sessionId: sid }
-        }
-        case 'Target.detachFromTarget':
-          sessions.delete(params.sessionId)
-          return {}
-        case 'Target.createTarget': {
-          const id = 'created-' + (pages.length + 1)
-          pages.push({ targetId: id, url: params.url ?? 'about:blank', visible: false })
-          return { targetId: id }
-        }
-        case 'Target.closeTarget':
-          return {}
-        case 'Runtime.enable':
-          return {}
-        case 'Page.enable':
-          return {}
-        case 'Runtime.evaluate': {
-          // probeForeground 用它问「你是不是在前台」
-          const targetId = sessions.get(sessionId)
-          return { result: { value: {
-            vis: visibleOf(targetId) ? 'visible' : 'hidden',
-            focus: visibleOf(targetId),
-            url: pages.find((p) => p.targetId === targetId)?.url ?? '',
-          } } }
-        }
-        case 'Page.getFrameTree':
-          return { frameTree: { frame: { id: 'F0', url: pages.find((p) => p.targetId === sessions.get(sessionId))?.url ?? '' } } }
-        default:
-          return {}
-      }
-    },
-    on() { return () => {} },
-    close() {},
-  }
-  return { sock, calls, pages }
-}
-
-console.log('\n═══ 一、选页逻辑（用户直接指出的问题 ③）═══\n')
-
-const { ensureWorkTab } = await import('file:///' + path.join(PLUGIN, 'lib', 'browser.mjs').replace(/\\/g, '/'))
-
-// 场景：浏览器里有三个页 —— 一个空白、一个学习通课程页（后台）、一个学习通任务页（前台）
-const mkScene = () => fakeBrowser([
-  { targetId: 'T-blank', url: 'about:blank', visible: false },
-  { targetId: 'T-home', url: 'https://i.chaoxing.com/base', visible: false },
-  { targetId: 'T-task', url: 'https://mooc1.chaoxing.com/mycourse/studentstudy?chapterId=1210980891', visible: true },
-])
-
-await ta('preferForeground：绑到用户正在看的那个学习通页（不是空白页、不是课程页）', async () => {
-  const b = mkScene()
-  const page = await ensureWorkTab(b, { preferForeground: true })
-  assert.equal(page.targetId, 'T-task', '应该绑到前台的任务页')
-  assert.equal(page.__followedUser, true, '应该标记 __followedUser')
+t('A10 hand_pick: set 但没给选项 → USAGE（页面没动）', () => {
+  const r = A.checkArgs('hand_pick', { area: { i: 'r1' }, mode: 'set' })
+  eq(r.ok, false); eq(r.category, 'USAGE')
+})
+t('A11 hand_pick: clear 却给了选项 → USAGE', () => eq(A.checkArgs('hand_pick', { area: { i: 'r1' }, choose: [{ i: 'o1' }], mode: 'clear' }).ok, false))
+t('A12 hand_pick: choose 不是数组 → ARG', () => eq(A.checkArgs('hand_pick', { area: { i: 'r1' }, choose: 'o1' }).ok, false))
+t('A13 hand_pick 正常', () => {
+  const r = A.checkArgs('hand_pick', { area: { i: 'r1' }, choose: [{ i: 'o1' }, { text: 'B' }], mode: 'set' })
+  eq(r.ok, true); eq(r.args.choose.length, 2)
 })
 
-await ta('preferForeground：**没有**调用 goto / 没有新开标签页', async () => {
-  const b = mkScene()
-  await ensureWorkTab(b, { preferForeground: true })
-  const created = b.calls.filter((c) => c.method === 'Target.createTarget')
-  assert.equal(created.length, 0, '不该新建标签页')
-  const navigated = b.calls.filter((c) => c.method === 'Page.navigate')
-  assert.equal(navigated.length, 0, '不该导航')
+t('A14 hand_write: 缺 text → ARG', () => eq(A.checkArgs('hand_write', { area: { i: 'r1' } }).ok, false))
+t('A15 hand_write 正常', () => eq(A.checkArgs('hand_write', { area: { i: 'r1' }, text: 'x' }).args.mode, 'replace'))
+
+t('A16 hand_goto: 什么都没给 → ARG', () => eq(A.checkArgs('hand_goto', {}).ok, false))
+t('A17 hand_goto: 给两件 → ARG', () => eq(A.checkArgs('hand_goto', { url: 'https://a.com', back: true }).ok, false))
+t('A18 hand_goto: url 协议不对 → ARG', () => eq(A.checkArgs('hand_goto', { url: 'a.com' }).ok, false))
+t('A19 hand_goto back 正常', () => eq(A.checkArgs('hand_goto', { back: true }).args.back, true))
+
+t('A20 hand_tab: i/id 同时给 → ARG', () => eq(A.checkArgs('hand_tab', { i: 0, id: 'x' }).ok, false))
+t('A21 hand_tab: 都不给 → ARG', () => eq(A.checkArgs('hand_tab', {}).ok, false))
+t('A22 hand_tab: i 不是整数 → ARG', () => eq(A.checkArgs('hand_tab', { i: 1.5 }).ok, false))
+
+t('A23 hand_play: 默认 12 分钟', () => eq(A.checkArgs('hand_play', {}).args.maxMinutes, 12))
+t('A24 hand_play: 0 分钟 → ARG', () => eq(A.checkArgs('hand_play', { maxMinutes: 0 }).ok, false))
+
+t('A25 hand_submit: confirm 不是 true → USAGE', () => {
+  const r = A.checkArgs('hand_submit', { confirm: false, reviewed: 'tk', button: { i: 'b1' } })
+  eq(r.ok, false); eq(r.category, 'USAGE')
+})
+t('A26 hand_submit: 缺票据 → ARG', () => eq(A.checkArgs('hand_submit', { confirm: true, button: { i: 'b1' } }).ok, false))
+t('A27 hand_submit: 缺按钮 → ARG', () => eq(A.checkArgs('hand_submit', { confirm: true, reviewed: 'tk' }).ok, false))
+t('A28 hand_submit 正常', () => eq(A.checkArgs('hand_submit', { confirm: true, reviewed: 'tk_1', button: { i: 'b1' } }).ok, true))
+
+t('A29 hand_note: 什么都没说 → ARG', () => eq(A.checkArgs('hand_note', {}).ok, false))
+t('A30 hand_note: 同时 add+read → ARG', () => eq(A.checkArgs('hand_note', { add: 'x', read: true }).ok, false))
+t('A31 hand_note add 正常（tag 默认 general）', () => {
+  const r = A.checkArgs('hand_note', { add: 'x' })
+  eq(r.ok, true); eq(r.args.tag, 'general')
 })
 
-await ta('探前台时会 attach 再 detach，不留残余 session', async () => {
-  const b = mkScene()
-  await ensureWorkTab(b, { preferForeground: true })
-  const att = b.calls.filter((c) => c.method === 'Target.attachToTarget').length
-  const det = b.calls.filter((c) => c.method === 'Target.detachFromTarget').length
-  // 每探一个页面就 attach+detach 一次，最后再 attach 一次作为真正的绑定
-  assert.equal(att - 1, det, `attach=${att} detach=${det} 应该正好差 1（最后那个才是绑定）`)
+t('A32 hand_verdict: 键写成"第3题" → ARG，并点明是"第几处"', () => {
+  const r = A.checkArgs('hand_verdict', { picks: { 第3题: ['A'] } })
+  eq(r.ok, false); eq(r.category, 'ARG')
+  ta('A32b 提示说是第几处', /第几处/.test(r.error + (r.expected ?? '')), r.error)
+})
+t('A33 hand_verdict: 值是字符串不是数组 → ARG', () => eq(A.checkArgs('hand_verdict', { picks: { 1: 'A' } }).ok, false))
+t('A34 hand_verdict: 空登记 → USAGE', () => eq(A.checkArgs('hand_verdict', { picks: {} }).ok, false))
+t('A35 hand_verdict 正常', () => eq(A.checkArgs('hand_verdict', { picks: { 1: ['B'] } }).ok, true))
+
+t('A36 不认识的工具 → 不拦（内部用）', () => eq(A.checkArgs('nope', {}).ok, true))
+
+// ── ★ 零副作用：结构保证 ───────────────────────────────────────────────────
+t('A37 args.mjs 是纯的（不 import 任何东西）', () => {
+  const src = read('lib/args.mjs')
+  ta('A37b 没有 import 语句', !/^\s*import\s/m.test(src))
+})
+t('A38 index.js 里 checkArgs 一定排在做事之前', () => {
+  const src = read('index.js')
+  const iCheck = src.indexOf('const chk = checkArgs(')
+  const iRun = src.indexOf('await def.run(chk.args, exec)')
+  ta('A38b 两处都在', iCheck > 0 && iRun > 0)
+  ta('A38c 校验在前、干活在后', iCheck < iRun, `checkArgs@${iCheck} run@${iRun}`)
+  ta('A38d 校验失败直接 return（不往下走）', /if \(!chk\.ok\) return chk/.test(src))
 })
 
-await ta('不带 preferForeground：沿用记录的 targetId（干活中途不重绑）', async () => {
-  const b = mkScene()
-  const page = await ensureWorkTab(b, { targetId: 'T-home' })
-  assert.equal(page.targetId, 'T-home', '应该沿用记录的页，不被前台页抢走')
-  assert.notEqual(page.__followedUser, true)
+// ═══════════════════════════════════════════════════════════════════════════
+// B 复核闸门
+// ═══════════════════════════════════════════════════════════════════════════
+
+const areaPick = (i, n = 4, filled = []) => ({
+  i, kind: 'pick', label: '…', frame: '主页面', done: false,
+  options: Array.from({ length: n }, (_, k) => ({ i: `${i}o${k}`, label: 'ABCD'[k], text: '', selected: filled.includes('ABCD'[k]) })),
+  filled,
 })
+const areaWrite = (i, filled = '') => ({ i, kind: 'write', label: '…', frame: '主页面', done: false, filled })
 
-await ta('前台页不存在时：退回"最像在用的那个"（studentstudy 优先）', async () => {
-  const b = fakeBrowser([
-    { targetId: 'T-home', url: 'https://i.chaoxing.com/base', visible: false },
-    { targetId: 'T-task', url: 'https://mooc1.chaoxing.com/mycourse/studentstudy?x=1', visible: false },
-  ])
-  const page = await ensureWorkTab(b, { preferForeground: true })
-  assert.equal(page.targetId, 'T-task', 'studentstudy 得分更高')
-})
-
-console.log('\n═══ 二、空白标签页（用户指出的问题 ②）═══\n')
-
-await ta('只有浏览器自带的空白页时：**接管它**，不再新开一个', async () => {
-  const b = fakeBrowser([{ targetId: 'T-blank', url: 'about:blank', visible: true }])
-  const page = await ensureWorkTab(b, { preferForeground: true })
-  assert.equal(page.targetId, 'T-blank', '应该接管那个空白页')
-  const created = b.calls.filter((c) => c.method === 'Target.createTarget')
-  assert.equal(created.length, 0, '不该再开第二个空白页')
-})
-
-await ta('一个页面都没有时：才新建', async () => {
-  const b = fakeBrowser([])
-  const page = await ensureWorkTab(b, { preferForeground: true })
-  const created = b.calls.filter((c) => c.method === 'CreateTarget' || c.method === 'Target.createTarget')
-  assert.equal(created.length, 1, '应该新建一个')
-  assert.equal(page.__ownsWorkTab, true)
-})
-
-console.log('\n═══ 三、截图必须真的把图交给模型（最严重的问题 ④）═══\n')
-
-const tools = []
-const saved = []
-const ctx = {
-  effect: (fn) => { const d = fn(); return () => (typeof d === 'function' ? d() : undefined) },
-  logger: { warn: () => {} },
-  get: (n) => {
-    if (n === 'systemPrompt') return { section: () => () => {} }
-    if (n === 'sessions') return { get: () => ({ header: { cwd: 'D:\\tmp' } }) }
-    if (n === 'agents') return { list: () => [{ id: 'MAIN' }], isOwnedBy: () => false }
-    if (n === 'attachments') return {
-      async saveImage({ data, mediaType, name }) {
-        saved.push({ bytes: data.length, mediaType, name })
-        return { attachmentId: 'att-' + saved.length, mediaType, bytes: data.length, width: 800, height: 600, name }
-      },
-    }
-    return undefined
-  },
-  tools: { register: (x) => { tools.push(x); return () => {} } },
-}
-const mod = await import('file:///' + path.join(PLUGIN, 'index.js').replace(/\\/g, '/'))
-mod.apply(ctx, {})
-
-const shotTool = tools.find((x) => x.name === 'cx_shot')
-
-t('cx_shot 注册了 output.render（没有它图就送不出去）', () => {
-  assert.ok(shotTool, 'cx_shot 应该已注册')
-  assert.equal(typeof shotTool.output?.render, 'function', 'output.render 必须是函数')
-})
-
-t('objOut.render：有 __images 时产出真正的 image 块', () => {
-  const ref = { attachmentId: 'att-1', mediaType: 'image/png', bytes: 1234, width: 800, height: 600 }
-  const blocks = shotTool.output.render({}, { ok: true, file: 'x.png', __images: [ref] })
-  assert.equal(blocks.length, 2, '应该是一个 text + 一个 image')
-  assert.equal(blocks[0].type, 'text')
-  assert.equal(blocks[1].type, 'image', '第二个块必须是 image')
-  assert.deepEqual(blocks[1].attachment, ref, 'image 块要带上 attachment ref')
-})
-
-t('objOut.render：__images 不该出现在给模型看的文字里', () => {
-  const ref = { attachmentId: 'att-1', mediaType: 'image/png', bytes: 1, width: 1, height: 1 }
-  const blocks = shotTool.output.render({}, { ok: true, __images: [ref] })
-  assert.ok(!/__images/.test(blocks[0].text), '文字里不该有 __images 这种内部字段：' + blocks[0].text)
-  assert.deepEqual(Object.keys(JSON.parse(blocks[0].text)), ['ok'], '文字里只该剩业务字段')
-})
-
-t('objOut.render：没有 __images 时退化成纯文字（不影响其它工具）', () => {
-  const blocks = shotTool.output.render({}, { ok: true, foo: 1 })
-  assert.equal(blocks.length, 1)
-  assert.equal(blocks[0].type, 'text')
-})
-
-console.log('\n═══ 四、工具表面（防止再次出现"提示词写了但工具不存在"）═══\n')
-
-const names = tools.map((x) => x.name)
-t('cx_shot 的描述里不再承诺"DSH 会自动显示图片"这种没验证的话', () => {
-  const d = shotTool.description
-  assert.ok(!/DSH 会自动显示图片/.test(d), '旧描述是错的（当时根本没有图）：' + d.slice(0, 80))
-})
-
-t('cx_do 只有 play / read / answer 三个动作', () => {
-  const cxd = tools.find((x) => x.name === 'cx_do')
-  assert.deepEqual(cxd.parameters.properties.action.enum, ['play', 'read', 'answer'])
-})
-
-t('每个 cx_* 工具都有 output.render', () => {
-  for (const x of tools) assert.equal(typeof x.output?.render, 'function', x.name + ' 缺 output.render')
-})
-
-console.log('\n═══ 五、预设自检（防止引用不存在的插件）═══\n')
-
-const yml = fs.readFileSync(path.join(PLUGIN, 'cordis.patch.yml'), 'utf8')
-
-t('cordis.patch.yml 里每个 @deepseek-ai/* 插件都真实存在', () => {
-  const refs = [...yml.matchAll(/name:\s*'(@deepseek-ai\/[^']+)'/g)].map((m) => m[1])
-  assert.ok(refs.length > 0, '解析不到任何插件引用，YAML 结构可能变了')
-  // 在本机找 DSH 的 app.asar（找不到就跳过这条，不让 CI/别的机器红）
-  const asar = 'C:\\Users\\23500\\AppData\\Local\\Programs\\DeepSeek Harness\\resources\\app.asar'
-  if (!fs.existsSync(asar)) { console.log('       （本机没有 app.asar，跳过存在性检查）'); return }
-  const idx = fs.readFileSync(asar, 'latin1')
-  for (const ref of refs) {
-    const short = ref.replace('@deepseek-ai/', '')
-    assert.ok(
-      idx.includes(`node_modules/@deepseek-ai/${short}/package.json`),
-      `${ref} 在 asar 里找不到 —— 预设会加载失败`,
-    )
-  }
-})
-
-t('预设的 plugins 里带了 tool-fs（否则模型没有 read_image，判题员派不出去）', () => {
-  assert.ok(/dsh-tool-fs/.test(yml), '缺 tool-fs：模型将没有 read/write/read_image')
-})
-
-t('cx_open 只在"不在学习通上"时才导航（否则会冲掉用户翻好的页）', () => {
-  const src = fs.readFileSync(path.join(PLUGIN, 'index.js'), 'utf8')
-  const body = src.slice(src.indexOf("name: 'cx_open'"), src.indexOf("name: 'cx_note'"))
-  assert.ok(/if \(!onChaoxing\)/.test(body), 'cx_open 里应该有 `if (!onChaoxing)` 守卫')
-  assert.ok(!/execute\(\)\s*\{\s*const work[^]*?await work\.goto\(OBS\.HOME_URL/.test(body),
-    'cx_open 不该无条件 goto 首页')
-})
-
-t('cx_open 会报告自检信息（attachmentsAvailable / boundTab / tabs）', () => {
-  const src = fs.readFileSync(path.join(PLUGIN, 'index.js'), 'utf8')
-  const body = src.slice(src.indexOf("name: 'cx_open'"), src.indexOf("name: 'cx_note'"))
-  for (const k of ['attachmentsAvailable', 'boundTab', 'followedUserTab']) {
-    assert.ok(body.includes(k), 'cx_open 的返回里应该有 ' + k)
-  }
-})
-
-console.log('\n═══ 六、判题覆盖检查（防「漏答」）═══\n')
-
-const CHK = await import('file:///' + path.join(PLUGIN, 'lib', 'check.mjs').replace(/\\/g, '/'))
-
-t('★ 真机失败案例：5 题库只给 4 个答案 → 拦下，并指出漏的是第 5 题', () => {
-  const bad = { 1: ['B'], 2: ['A'], 3: ['A', 'B', 'C'], 4: ['B'] }
-  const cov = CHK.checkAnswerCoverage(5, bad)
-  assert.equal(cov.ok, false, '不该放行')
-  assert.deepEqual(cov.missing, [5], '应该指出漏的是第 5 题')
-  assert.ok(/没有提交/.test(CHK.describeAnswerGap(cov)), '提示要说清「没有提交」')
-})
-
-t('答全了就放行', () => {
-  const cov = CHK.checkAnswerCoverage(5, { 1: ['A'], 2: ['B'], 3: ['C'], 4: ['A'], 5: ['B'] })
-  assert.equal(cov.ok, true)
-  assert.equal(CHK.describeAnswerGap(cov), null)
-})
-
-t('给了题号但选项是空数组 → 也算漏答', () => {
-  const cov = CHK.checkAnswerCoverage(3, { 1: ['A'], 2: ['B'], 3: [] })
-  assert.equal(cov.ok, false)
-  assert.deepEqual(cov.empty, [3])
-})
-
-t('题号超出题量（数错了）→ 拦下', () => {
-  const cov = CHK.checkAnswerCoverage(5, { 1: ['A'], 2: ['B'], 3: ['C'], 4: ['A'], 5: ['B'], 6: ['D'] })
-  assert.equal(cov.ok, false)
-  assert.deepEqual(cov.extra, [6])
-})
-
-t('题量读不到（0）时不误拦 —— 那是我们读不出来，不是模型漏答', () => {
-  const cov = CHK.checkAnswerCoverage(0, { 1: ['A'] })
-  assert.equal(cov.ok, true, 'total=0 时不该拦，否则会卡死')
-})
-
-t('cx_do answer 真的接上了覆盖检查', () => {
-  const src = fs.readFileSync(path.join(PLUGIN, 'index.js'), 'utf8')
-  assert.ok(/CHK\.checkAnswerCoverage\(/.test(src), 'index.js 里没调用 checkAnswerCoverage')
-  assert.ok(/ANSWERS_INCOMPLETE/.test(src), '没返回 ANSWERS_INCOMPLETE')
-})
-
-t('cx_do answer 提交后会报告分数差距（没满分时）', () => {
-  const src = fs.readFileSync(path.join(PLUGIN, 'index.js'), 'utf8')
-  assert.ok(/scoreGap/.test(src), '没给没满分的提示')
-})
-
-console.log('\n═══ 七、答案形状检查（防「题号/题型错位」）═══\n')
-
-const QS = [
-  { kind: '单选题', options: [{ letter: 'A' }, { letter: 'B' }, { letter: 'C' }, { letter: 'D' }] },
-  { kind: '单选题', options: [{ letter: 'A' }, { letter: 'B' }, { letter: 'C' }, { letter: 'D' }] },
-  { kind: '判断题', isTruth: true, options: [{ letter: 'A' }, { letter: 'B' }] },
-  { kind: '判断题', isTruth: true, options: [{ letter: 'A' }, { letter: 'B' }] },
-  { kind: '判断题', isTruth: true, options: [{ letter: 'A' }, { letter: 'B' }] },
+const AREAS = [
+  areaPick('r1', 4, ['B']),
+  areaWrite('r2', '实践是检验真理的唯一标准'),
+  areaPick('r3', 2, ['A']),
 ]
 
-t('★ 真机失败案例：第 3 题是判断题（只有 A/B），模型给了 A、B、C → 拦下并说清', () => {
-  const r = CHK.checkAnswerShape(QS, { 1: ['C'], 2: ['B'], 3: ['A', 'B', 'C'], 4: ['A'], 5: ['B'] })
-  assert.equal(r.ok, false)
-  assert.equal(r.problems.length, 1)
-  assert.equal(r.problems[0].q, 3)
-  assert.equal(r.problems[0].type, 'NO_SUCH_OPTION')
-  assert.deepEqual(r.problems[0].available, ['A', 'B'], '要如实报出这题只有 A、B')
-  const msg = CHK.describeShapeProblems(r)
-  assert.ok(/只有 A、B/.test(msg), '提示要写清这题只有几个选项')
-  assert.ok(/判断题/.test(msg), '提示要写清题型')
+t('B1 对账清单只收「挑」的，且编号按全部挑的题数（跳过写的）', () => {
+  const l = G.buildLedger(AREAS)
+  eq(l.length, 2)
+  eq(l[0].n, 1); eq(l[0].i, 'r1')
+  eq(l[1].n, 2); eq(l[1].i, 'r3')
+})
+t('B2 清单里不给任何文字（只给结构）', () => {
+  const l = G.buildLedger(AREAS)
+  ta('B2b 没有 label 字段', !('label' in l[0]))
+  ta('B2c 没有选项文字', !('options' in l[0]))
+  eq(l[0].optionsCount, 4)
+})
+t('B3 ignore 不改变编号（否则主脑和复核员对不上）', () => {
+  const l = G.buildLedger(AREAS, [1])
+  eq(l.length, 1)
+  eq(l[0].n, 2)      // 仍然是 2，不是 1
+  eq(l[0].i, 'r3')
 })
 
-t('单选题给两个字母 → 拦下', () => {
-  const r = CHK.checkAnswerShape([{ kind: '单选题', options: [{ letter: 'A' }, { letter: 'B' }] }], { 1: ['A', 'B'] })
-  assert.equal(r.ok, false)
-  assert.equal(r.problems[0].type, 'TOO_MANY_FOR_SINGLE')
+t('B4 页面内容变了 → 指纹变', () => {
+  const a = G.pageFingerprint({ targetId: 'T', url: 'u', areas: AREAS })
+  const b = G.pageFingerprint({ targetId: 'T', url: 'u', areas: [areaPick('r1', 4, ['C']), AREAS[1], AREAS[2]] })
+  ta('B4b 不一样', a !== b)
+})
+t('B5 没变就不变（滚动/截图不该作废票据）', () => {
+  const a = G.pageFingerprint({ targetId: 'T', url: 'u', areas: AREAS })
+  const b = G.pageFingerprint({ targetId: 'T', url: 'u', areas: JSON.parse(JSON.stringify(AREAS)) })
+  eq(a, b)
+})
+t('B6 换一套题 → 清单指纹变（常驻复核员不串题）', () => {
+  const a = G.ledgerHash(G.buildLedger(AREAS))
+  const b = G.ledgerHash(G.buildLedger([areaPick('r9', 4, ['B']), AREAS[1], areaPick('r8', 2, ['A'])]))
+  ta('B6b 不一样', a !== b)
 })
 
-t('判断题给两个字母 → 拦下', () => {
-  const r = CHK.checkAnswerShape([{ kind: '判断题', isTruth: true, options: [{ letter: 'A' }, { letter: 'B' }] }], { 1: ['A', 'B'] })
-  assert.equal(r.ok, false)
-  assert.equal(r.problems[0].type, 'TOO_MANY_FOR_SINGLE')
+t('B7 标签归一化', () => {
+  eq(G.normLabel('Ｂ'), 'B')
+  eq(G.normLabel('b'), 'B')
+  eq(G.normLabel('B.'), 'B')
+  eq(G.normLabel(' 对 '), '对')
+})
+t('B8 集合比对不看顺序', () => ta('B8b', G.samePick(['B', 'C'], ['C', 'B'])))
+
+t('B9 同一个复核员重登记 → 覆盖，不算两个人', () => {
+  let store = {}
+  store = G.recordVerdict(store, { ledgerHash: 'L', judgeId: 'g1', picks: { 1: ['A'], 2: ['A'] } })
+  store = G.recordVerdict(store, { ledgerHash: 'L', judgeId: 'g1', picks: { 1: ['B'], 2: ['A'] }, round: 2 })
+  eq(G.judgeSummary(store, 'L').registered, 1)
+  eq(G.judgeSummary(store, 'L').entries[0].picks['1'][0], 'B')
+})
+t('B10 两个不同身份 → 两份', () => {
+  let store = {}
+  store = G.recordVerdict(store, { ledgerHash: 'L', judgeId: 'g1', picks: {} })
+  store = G.recordVerdict(store, { ledgerHash: 'L', judgeId: 'g2', picks: {} })
+  eq(G.judgeSummary(store, 'L').registered, 2)
 })
 
-t('多选题只给一个字母 → **只提醒不拦**（只有一个正确项是合法的）', () => {
-  const r = CHK.checkAnswerShape([{ kind: '多选题', options: [{ letter: 'A' }, { letter: 'B' }] }], { 1: ['A'] })
-  assert.equal(r.ok, true, '不该拦 —— 多选题可能只有一个正确项')
-  assert.equal(r.notes.length, 1)
-  assert.equal(r.notes[0].type, 'ONLY_ONE_FOR_MULTI')
+function gateWith({ areas = AREAS, ignore = [], entries = [], submitButton = null, submitFound = true } = {}) {
+  const ledger = G.buildLedger(areas, ignore)
+  const lh = G.ledgerHash(ledger)
+  return { ledger, lh, gate: G.checkGate({ areas, ledger, entries, ignore, submitButton, submitFound }) }
+}
+const twoJudges = (p1, p2, u = []) => ([
+  { id: 'grader-1-xxxx', picks: p1, uncertain: u },
+  { id: 'grader-2-yyyy', picks: p2, uncertain: u },
+])
+
+t('B11 全对 → PASS', () => {
+  const { gate } = gateWith({ entries: twoJudges({ 1: ['B'], 2: ['A'] }, { 1: ['B'], 2: ['A'] }) })
+  eq(gate.verdict, 'PASS')
+  ta('B11b pass=true', gate.pass === true)
+})
+t('B12 挑的题空着 → EMPTY_PICK', () => {
+  const { gate } = gateWith({ areas: [areaPick('r1', 4, []), areaPick('r3', 2, ['A'])], entries: twoJudges({ 1: ['B'], 2: ['A'] }, { 1: ['B'], 2: ['A'] }) })
+  eq(gate.verdict, 'EMPTY_PICK')
+})
+t('B13 选了页面上没有的项 → OUT_OF_RANGE', () => {
+  const { gate } = gateWith({ areas: [areaPick('r1', 2, ['C']), areaPick('r3', 2, ['A'])], entries: twoJudges({ 1: ['C'], 2: ['A'] }, { 1: ['C'], 2: ['A'] }) })
+  eq(gate.verdict, 'OUT_OF_RANGE')
+})
+t('B14 写的地方空着 → EMPTY_WRITE', () => {
+  const { gate } = gateWith({ areas: [areaPick('r1', 4, ['B']), areaWrite('r2', '   '), areaPick('r3', 2, ['A'])], entries: twoJudges({ 1: ['B'], 2: ['A'] }, { 1: ['B'], 2: ['A'] }) })
+  eq(gate.verdict, 'EMPTY_WRITE')
+})
+t('B15 复核员不够两份 → NEED_TWO_REVIEWERS', () => {
+  const { gate } = gateWith({ entries: [{ id: 'grader-1-xxxx', picks: { 1: ['B'], 2: ['A'] }, uncertain: [] }] })
+  eq(gate.verdict, 'NEED_TWO_REVIEWERS')
+})
+t('B16 三份不一致 → REVIEWERS_DISSENT', () => {
+  const { gate } = gateWith({ entries: twoJudges({ 1: ['B'], 2: ['A'] }, { 1: ['C'], 2: ['A'] }) })
+  eq(gate.verdict, 'REVIEWERS_DISSENT')
+  ta('B16b 说清是哪一处', gate.problems.some((p) => p.n === 1), JSON.stringify(gate.problems))
+})
+t('B17 有人拿不准 → 拦住且说明', () => {
+  const { gate } = gateWith({ entries: twoJudges({ 2: ['A'] }, { 1: ['B'], 2: ['A'] }, [1]) })
+  ta('B17b 拦住了', !gate.pass, gate.verdict)
+  ta('B17c 提到拿不准', gate.problems.some((p) => /拿不准/.test(p.text)), JSON.stringify(gate.problems))
+})
+t('B18 交的按钮找不到 → NO_SUBMIT_TARGET', () => {
+  const { gate } = gateWith({
+    entries: twoJudges({ 1: ['B'], 2: ['A'] }, { 1: ['B'], 2: ['A'] }),
+    submitButton: { i: 'b1' }, submitFound: false,
+  })
+  eq(gate.verdict, 'NO_SUBMIT_TARGET')
 })
 
-t('全套形状正确 → 放行', () => {
-  assert.equal(CHK.checkAnswerShape(QS, { 1: ['C'], 2: ['B'], 3: ['A'], 4: ['A'], 5: ['B'] }).ok, true)
+t('B19 不过 → 没有票据', () => {
+  const { gate, lh } = gateWith({ entries: [] })
+  eq(G.makeToken({ fingerprint: 'F', ledgerHash: lh, gate }), null)
+})
+t('B20 过了 → 有票据', () => {
+  const { gate, lh } = gateWith({ entries: twoJudges({ 1: ['B'], 2: ['A'] }, { 1: ['B'], 2: ['A'] }) })
+  ta('B20b', typeof G.makeToken({ fingerprint: 'F', ledgerHash: lh, gate }) === 'string')
 })
 
-t('读不到选项（optionCount=0）时不误拦', () => {
-  const r = CHK.checkAnswerShape([{ kind: '单选题', options: [] }], { 1: ['A'] })
-  assert.equal(r.ok, true, '选项读不到就不该拦，否则会卡死')
+t('B21 票据：对得上就放行', () => {
+  const { gate, lh } = gateWith({ entries: twoJudges({ 1: ['B'], 2: ['A'] }, { 1: ['B'], 2: ['A'] }) })
+  const tk = G.makeToken({ fingerprint: 'F', ledgerHash: lh, gate })
+  eq(G.verifyToken(tk, { fingerprint: 'F', ledgerHash: lh }).ok, true)
+})
+t('B22 票据：页面变了 → STALE_TOKEN', () => {
+  const { gate, lh } = gateWith({ entries: twoJudges({ 1: ['B'], 2: ['A'] }, { 1: ['B'], 2: ['A'] }) })
+  const tk = G.makeToken({ fingerprint: 'F', ledgerHash: lh, gate })
+  const v = G.verifyToken(tk, { fingerprint: 'F2', ledgerHash: lh })
+  eq(v.ok, false); eq(v.code, 'STALE_TOKEN')
+})
+t('B23 票据：换了一套题 → STALE_TOKEN', () => {
+  const { gate, lh } = gateWith({ entries: twoJudges({ 1: ['B'], 2: ['A'] }, { 1: ['B'], 2: ['A'] }) })
+  const tk = G.makeToken({ fingerprint: 'F', ledgerHash: lh, gate })
+  eq(G.verifyToken(tk, { fingerprint: 'F', ledgerHash: 'OTHER' }).code, 'STALE_TOKEN')
+})
+t('B24 票据：过期 → STALE_TOKEN', () => {
+  const { gate, lh } = gateWith({ entries: twoJudges({ 1: ['B'], 2: ['A'] }, { 1: ['B'], 2: ['A'] }) })
+  const tk = G.makeToken({ fingerprint: 'F', ledgerHash: lh, gate, now: 1000 })
+  eq(G.verifyToken(tk, { fingerprint: 'F', ledgerHash: lh, now: 1000 + 16 * 60_000 }).code, 'STALE_TOKEN')
+})
+t('B25 票据：压根没给 → NEED_REVIEW', () => {
+  eq(G.verifyToken(undefined, { fingerprint: 'F', ledgerHash: 'L' }).code, 'NEED_REVIEW')
+})
+t('B26 ★ 没有 afterReview 后门 —— 不一致时给什么都不发票据', () => {
+  const { gate, lh } = gateWith({ entries: twoJudges({ 1: ['B'], 2: ['A'] }, { 1: ['C'], 2: ['A'] }) })
+  eq(G.makeToken({ fingerprint: 'F', ledgerHash: lh, gate, afterReview: true }), null)
+})
+t('B27 复核员重登记（round 2）且这次一致 → 重新可交', () => {
+  let store = {}
+  store = G.recordVerdict(store, { ledgerHash: 'L', judgeId: 'g1', picks: { 1: ['B'], 2: ['A'] } })
+  store = G.recordVerdict(store, { ledgerHash: 'L', judgeId: 'g2', picks: { 1: ['C'], 2: ['A'] } })
+  const entries1 = Object.entries(store['L']).map(([id, v]) => ({ id, ...v }))
+  const g1 = G.checkGate({ areas: AREAS, ledger: G.buildLedger(AREAS), entries: entries1 })
+  eq(g1.verdict, 'REVIEWERS_DISSENT')
+
+  store = G.recordVerdict(store, { ledgerHash: 'L', judgeId: 'g2', picks: { 1: ['B'], 2: ['A'] }, round: 2 })
+  const entries2 = Object.entries(store['L']).map(([id, v]) => ({ id, ...v }))
+  const g2 = G.checkGate({ areas: AREAS, ledger: G.buildLedger(AREAS), entries: entries2 })
+  eq(g2.verdict, 'PASS')
+  eq(G.judgeSummary(store, 'L').registered, 2)
 })
 
-t('cx_do answer 真的接上了形状检查（且在点击之前）', () => {
-  const src = fs.readFileSync(path.join(PLUGIN, 'index.js'), 'utf8')
-  assert.ok(/CHK\.checkAnswerShape\(/.test(src), '没调用 checkAnswerShape')
-  assert.ok(/ANSWERS_SHAPE_MISMATCH/.test(src), '没返回 ANSWERS_SHAPE_MISMATCH')
-  const iShape = src.indexOf('CHK.checkAnswerShape(')
-  const iClick = src.indexOf('ACT.answerQuiz(')
-  assert.ok(iShape > 0 && iClick > 0 && iShape < iClick, '形状检查必须在点击之前')
+// ═══════════════════════════════════════════════════════════════════════════
+// C 工具表面
+// ═══════════════════════════════════════════════════════════════════════════
+
+const IDX = read('index.js')
+const TOOLS = [...IDX.matchAll(/name:\s*'(eye_[a-z]+|hand_[a-z]+)'/g)].map((m) => m[1])
+
+t('C1 一共 15 个工具', () => eq(TOOLS.length, 15, `实际 ${TOOLS.length}：${TOOLS.join(',')}`))
+t('C2 眼 5 个', () => {
+  const eyes = TOOLS.filter((x) => x.startsWith('eye_'))
+  eq(eyes.length, 5, eyes.join(','))
+  for (const n of ['eye_open', 'eye_see', 'eye_list', 'eye_shot', 'eye_check']) ta(`C2b ${n}`, eyes.includes(n))
+})
+t('C3 手 10 个', () => {
+  const hands = TOOLS.filter((x) => x.startsWith('hand_'))
+  eq(hands.length, 10, hands.join(','))
+  for (const n of ['hand_click', 'hand_pick', 'hand_write', 'hand_scroll', 'hand_goto', 'hand_tab',
+    'hand_play', 'hand_submit', 'hand_note', 'hand_verdict']) ta(`C3b ${n}`, hands.includes(n))
+})
+t('C4 不许再有旧前缀', () => ta('C4b', !/\bcx_[a-z]/.test(IDX)))
+t('C5 并发标志：只读的是 true，会动手的是 false', () => {
+  // 判断标准：**会不会动页面**。只读（眼 + 笔记 + 登记）可以并发；动手的必须串行。
+  const READONLY = new Set(['eye_open', 'eye_see', 'eye_list', 'eye_shot', 'eye_check', 'hand_note', 'hand_verdict'])
+  const blocks = IDX.split(/reg\(\{/).slice(1)
+  for (const b of blocks) {
+    const nm = /name:\s*'([a-z_]+)'/.exec(b)?.[1]
+    if (!nm) continue
+    const safe = /isConcurrencySafe:\s*\(\)\s*=>\s*true/.test(b.slice(0, 900))
+    if (READONLY.has(nm)) ta(`C5b ${nm} 只读，应为 true`, safe)
+    else ta(`C5c ${nm} 会动页面，应为 false`, !safe)
+  }
+})
+t('C6 会动手的手都上了串行锁', () => {
+  const blocks = IDX.split(/reg\(\{/).slice(1)
+  for (const b of blocks) {
+    const nm = /name:\s*'([a-z_]+)'/.exec(b)?.[1]
+    if (!nm || nm.startsWith('eye_') || nm === 'hand_note' || nm === 'hand_verdict') continue
+    ta(`C6b ${nm} 应有 serial: true`, /serial:\s*true/.test(b.slice(0, 900)))
+  }
+})
+t('C7 铁律写进代码：hand_play 参数里没有倍速/跳转/心跳', () => {
+  const i = IDX.indexOf("name: 'hand_play'")
+  const blk = IDX.slice(i, i + 1200)
+  for (const bad of ['rate', 'seek', 'heartbeat', 'speed', 'playbackRate']) {
+    ta(`C7b 参数里不该有 ${bad}`, !new RegExp(`${bad}\\s*:`).test(blk))
+  }
+})
+t('C8 hand_submit 不收答案（参数里没有 picks/answers）', () => {
+  const i = IDX.indexOf("name: 'hand_submit'")
+  const blk = IDX.slice(i, i + 900)
+  ta('C8b', !/\b(answers|picks)\s*:/.test(blk))
 })
 
-console.log('\n═══ 八、三方独立判题（用户要求：开两个智能体 + 有异议评审）═══\n')
+// ═══════════════════════════════════════════════════════════════════════════
+// D 痕迹检查
+// ═══════════════════════════════════════════════════════════════════════════
 
-const V1 = { 1: ['D'], 2: ['A', 'B', 'C', 'D'], 3: ['A'] }
-const V2 = { 1: ['D'], 2: ['A', 'B', 'C', 'D'], 3: ['A'] }
-const V3 = { 1: ['D'], 2: ['A', 'B', 'C', 'D'], 3: ['B'] }
+const PLATFORM = /chaoxing|学习通|超星|xuexitong|mooc\d|studentstudy|visit\/interaction|ananas/i
 
-t('normalizeAnswers：选项顺序和写法不影响比较', () => {
-  assert.equal(CHK.normalizeAnswers({ 2: ['C', 'A'], 1: ['b'] }), CHK.normalizeAnswers({ 1: ['B'], 2: ['A', 'C'] }))
-  assert.equal(CHK.normalizeAnswers({ 1: 'A,B' }), CHK.normalizeAnswers({ 1: ['B', 'A'] }), '字符串写法也要认')
+t('D1 index.js 里没有平台字样', () => ta('D1b', !PLATFORM.test(IDX), PLATFORM.exec(IDX)?.[0]))
+t('D2 lib/*.mjs 里没有平台字样', () => {
+  for (const f of readdirSync(join(ROOT, 'lib'))) {
+    if (!f.endsWith('.mjs')) continue
+    const src = readFileSync(join(ROOT, 'lib', f), 'utf8')
+    ta(`D2b lib/${f}`, !PLATFORM.test(src), PLATFORM.exec(src)?.[0])
+  }
 })
-
-t('只有一个判题员 → 不够，拦下', () => {
-  const r = CHK.compareJudgeAnswers(V1, [{ agentId: 'g1', answers: V1 }])
-  assert.equal(r.enough, false)
-  assert.equal(r.ok, false)
-  assert.equal(r.judgeCount, 1)
+t('D3 提示词里没有平台字样、也没有平台事实', () => {
+  const p = read('prompts/xuexi-mode.md')
+  ta('D3b', !PLATFORM.test(p), PLATFORM.exec(p)?.[0])
+  ta('D3c 不写 aria-label 这类站点细节', !/aria-label/i.test(p))
+  ta('D3d 不写 videojs 这类站点细节', !/videojs/i.test(p))
 })
-
-t('同一个判题员登记两次 → 仍只算一个', () => {
-  const r = CHK.compareJudgeAnswers(V1, [
-    { agentId: 'g1', answers: V1 }, { agentId: 'g1', answers: V1 },
-  ])
-  assert.equal(r.judgeCount, 1, '同一人重复登记不能凑数')
-  assert.equal(r.enough, false)
+t('D4 代码里不许写死某个网站的地址', () => {
+  // 本机地址、示例域名不算；其它真实域名一律不许出现 ——
+  // 写死任何一个网站的地址，就等于把"这个世界长什么样"钉死在代码里。
+  const ALLOW = /^(https?:\/\/)(127\.0\.0\.1|localhost|example\.com|www\.example\.com)\b/i
+  for (const f of readdirSync(join(ROOT, 'lib'))) {
+    if (!f.endsWith('.mjs')) continue
+    const src = readFileSync(join(ROOT, 'lib', f), 'utf8')
+    const hits = [...src.matchAll(/https?:\/\/[a-z0-9.-]+/gi)].map((m) => m[0]).filter((u) => !ALLOW.test(u))
+    ta(`D4b lib/${f} 里没有写死的网站地址：${hits.join(',')}`, hits.length === 0)
+  }
 })
-
-t('两个判题员 + 结论一致 + 和主脑一致 → 放行', () => {
-  const r = CHK.compareJudgeAnswers(V1, [
-    { agentId: 'g1', answers: V1 }, { agentId: 'g2', answers: V2 },
-  ])
-  assert.equal(r.judgeCount, 2)
-  assert.equal(r.ok, true)
-  assert.equal(r.dissenting.length, 0)
-})
-
-t('★ 两个判题员，其中一个和主脑不一致 → 拦下并要求评审', () => {
-  const r = CHK.compareJudgeAnswers(V1, [
-    { agentId: 'g1', answers: V1 }, { agentId: 'g2', answers: V3 },
-  ])
-  assert.equal(r.enough, true, '人数够')
-  assert.equal(r.ok, false, '但有异议，不该放行')
-  assert.equal(r.dissenting.length, 1)
-  assert.equal(r.dissenting[0].agentId, 'g2')
-})
-
-t('cx_verdict 已注册，且端口是"判题员专用"（闸门反过来）', async () => {
-  const vt = tools.find((x) => x.name === 'cx_verdict')
-  assert.ok(vt, '没注册 cx_verdict')
-  assert.ok(vt.parameters.required.includes('answers'), 'answers 应该是必填')
-  const src = fs.readFileSync(path.join(PLUGIN, 'index.js'), 'utf8')
-  assert.ok(/COMMANDER_CANNOT_JUDGE/.test(src), '缺少"主脑不能判题"的守卫')
-})
-
-t('★ 主脑调 cx_verdict 会被拒（闸门是反的）', async () => {
-  const vt = tools.find((x) => x.name === 'cx_verdict')
-  // mock ctx 里 agents.isOwnedBy 恒为 false → 当前 agent 不是子智能体 → 是主脑
-  const r = await vt.execute({ answers: { 1: ['A'] } }, { agent: { id: 'MAIN' } })
-  assert.equal(r.ok, false, '主脑不该能登记判题结论')
-  assert.equal(r.error, 'COMMANDER_CANNOT_JUDGE')
-})
-
-t('cx_do 有 afterReview 参数（评审完之后才能带异议提交）', () => {
-  const cxd = tools.find((x) => x.name === 'cx_do')
-  assert.ok(cxd.parameters.properties.afterReview, '缺 afterReview 参数')
-})
-
-t('cx_do answer 的闸门顺序：覆盖 → 形状 → 判题员 → 点击', () => {
-  const src = fs.readFileSync(path.join(PLUGIN, 'index.js'), 'utf8')
-  const i = (s) => src.indexOf(s)
-  const order = [
-    i('CHK.checkAnswerCoverage('),
-    i('CHK.checkAnswerShape('),
-    i('CHK.compareJudgeAnswers('),
-    i('ACT.answerQuiz('),
-  ]
-  for (const x of order) assert.ok(x > 0, '找不到某个闸门')
-  for (let k = 1; k < order.length; k++) {
-    assert.ok(order[k - 1] < order[k], `闸门顺序错了：第 ${k} 个应该在前面`)
+t('D5 旧文件已删', () => {
+  for (const f of ['lib/observe.mjs', 'lib/inventory.mjs', 'lib/act.mjs', 'lib/state.mjs', 'lib/check.mjs', 'prompts/chaoxing-mode.md']) {
+    ta(`D5b ${f} 应已删除`, !existsSync(join(ROOT, f)))
   }
 })
 
-t('cx_do read 会清空上一轮的判题登记（不同题的结论不能混用）', () => {
-  const src = fs.readFileSync(path.join(PLUGIN, 'index.js'), 'utf8')
-  const iRead = src.indexOf("case 'read': {")
-  const iAnswer = src.indexOf("case 'answer': {")
-  const body = src.slice(iRead, iAnswer)
-  assert.ok(/session\.verdicts = \[\]/.test(body), 'read 里没清空 verdicts')
+// ═══════════════════════════════════════════════════════════════════════════
+// E 预设自检
+// ═══════════════════════════════════════════════════════════════════════════
+
+const YML = read('cordis.patch.yml')
+const PKG = JSON.parse(read('package.json'))
+const PROMPT = read('prompts/xuexi-mode.md')
+
+t('E1 预设 id / 名字', () => {
+  ta('E1b id: xuexi', /id:\s*xuexi\b/.test(YML))
+  ta('E1c 名字：网课模式', /name:\s*网课模式/.test(YML))
+  ta('E1d 插件名 dsh-xuexi', /name:\s*dsh-xuexi\b/.test(YML))
+})
+t('E2 persona.prefix 必填且不带 complete', () => {
+  ta('E2b 有 prefix', /prefix:\s*\S/.test(YML))
+  ta('E2c 没有 complete', !/^\s*complete:\s*true/m.test(YML))
+})
+t('E3 文件工具在白名单里（否则复核员读不了图）', () => ta('E3b', /@deepseek-ai\/dsh-tool-fs/.test(YML)))
+t('E4 package.json 对得上', () => {
+  eq(PKG.name, 'dsh-xuexi')
+  eq(PKG.version, '2.0.0')
+  eq(PKG.dsh.id, 'dsh-xuexi')
+  eq(PKG.dsh.repo, 'LeuJasYoh/dsh-xuexi')
+})
+t('E5 插件导出 name/apply', () => {
+  ta('E5b', /export\s+function\s+apply/.test(IDX))
+  ta('E5c', /export\s+const\s+name/.test(IDX))
+})
+t('E6 提示词提到全部 15 个工具（模型得知道怎么调）', () => {
+  for (const n of TOOLS) ta(`E6b ${n}`, PROMPT.includes(n))
+})
+t('E7 提示词里有"复核员专用"分流', () => ta('E7b', /复核员专用/.test(PROMPT)))
+t('E8 提示词里有四类错误说明', () => {
+  for (const c of ['ARG', 'USAGE', 'WORLD', 'TOOL']) ta(`E8b ${c}`, PROMPT.includes(c))
+})
+t('E9 提示词里有三件万能事', () => ta('E9b', /三件万能事/.test(PROMPT)))
+t('E10 提示词里写明笔记不许写答案', () => ta('E10b', /永远不许写答案/.test(PROMPT)))
+t('E11 wait_agent 只等一次写进去了', () => ta('E11b', /只等一次/.test(PROMPT)))
+t('E12 铁律六条还在', () => {
+  for (const k of ['原速', '拖进度条', '伪造心跳', '串行', '破解', '不代填']) ta(`E12b ${k}`, PROMPT.includes(k))
 })
 
-console.log(`\n═══ 结果：${pass} 通过 / ${fail} 失败 ═══\n`)
-process.exit(fail ? 1 : 0)
+// ═══════════════════════════════════════════════════════════════════════════
+
+console.log(`\n${'─'.repeat(60)}`)
+if (fails.length) {
+  console.log(`✗ ${fails.length} 条没过（通过 ${pass} 条）\n`)
+  for (const f of fails) console.log(`  ✗ ${f}`)
+  process.exit(1)
+} else {
+  console.log(`✓ 全部通过：${pass} 条断言`)
+}

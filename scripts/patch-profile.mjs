@@ -16,7 +16,7 @@ const dryRun = args.includes('--dry-run')
 const pluginDirArg = args.find((a) => !a.startsWith('--'))
 if (!pluginDirArg) { console.error('用法: node patch-profile.mjs <pluginDir> [--dry-run]'); process.exit(2) }
 
-const PLUGIN_NAME = 'dsh-chaoxing'
+const PLUGIN_NAME = 'dsh-xuexi'
 const pluginDir = resolve(pluginDirArg).replace(/\\/g, '/')
 const profileDir = join(homedir(), '.dsh', 'profiles', 'desktop')
 const pkgPath = join(profileDir, 'package.json')
@@ -39,7 +39,7 @@ try { pkg = JSON.parse(before) } catch (e) {
 }
 
 // ── 校验插件本体 ────────────────────────────────────────────────────────────
-const required = ['index.js', 'cordis.patch.yml', 'package.json', 'prompts/chaoxing-mode.md']
+const required = ['index.js', 'cordis.patch.yml', 'package.json', 'prompts/xuexi-mode.md']
 const missing = required.filter((f) => {
   try { readFileSync(join(pluginDir, f)); return false } catch { return true }
 })

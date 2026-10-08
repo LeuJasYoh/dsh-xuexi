@@ -1,9 +1,10 @@
 # 忽略规则
 
 # ── 运行时产物（决不允许入库）────────────────────────────────────────────
-.chaoxing/
-**/.chaoxing/
+.xuexi/
+**/.xuexi/
 progress.json
+notes.json
 shots/
 *.png
 *.jpg

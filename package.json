@@ -1,7 +1,7 @@
 {
-  "name": "dsh-chaoxing",
-  "version": "1.5.0",
-  "description": "DSH 学习通模式：让大模型当司令、脚本当手，在学习通里按真实学习的方式完成课程任务点（原速 / 不拖拽 / 不伪造心跳）",
+  "name": "dsh-xuexi",
+  "version": "2.0.0",
+  "description": "DSH 网课模式：工具只当手和眼，判断全归大模型 —— 截图、列能点的、点一个看变化，任何网课页面都能自己摸出来",
   "type": "module",
   "license": "MIT",
   "main": "./index.js",
@@ -23,28 +23,27 @@
     "dsh",
     "deepseek-harness",
     "agent-preset",
-    "chaoxing",
-    "xuexitong",
     "browser-automation",
     "cdp",
-    "llm-agent"
+    "llm-agent",
+    "online-course"
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/LeuJasYoh/dsh-chaoxing.git"
+    "url": "git+https://github.com/LeuJasYoh/dsh-xuexi.git"
   },
   "bugs": {
-    "url": "https://github.com/LeuJasYoh/dsh-chaoxing/issues"
+    "url": "https://github.com/LeuJasYoh/dsh-xuexi/issues"
   },
-  "homepage": "https://github.com/LeuJasYoh/dsh-chaoxing#readme",
+  "homepage": "https://github.com/LeuJasYoh/dsh-xuexi#readme",
   "engines": {
     "node": ">=20"
   },
   "dsh": {
-    "id": "dsh-chaoxing",
-    "name": "学习通模式",
-    "version": "1.5.0",
-    "repo": "LeuJasYoh/dsh-chaoxing",
+    "id": "dsh-xuexi",
+    "name": "网课模式",
+    "version": "2.0.0",
+    "repo": "LeuJasYoh/dsh-xuexi",
     "engines": {
       "dsh": ">=0.2.0"
     },

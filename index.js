@@ -1,274 +1,59 @@
-// dsh-chaoxing —— 学习通自动化插件
-//
-// ═══════════════════════════════════════════════════════════════════════════
-//  ★ 铁律：工具里不允许有任何业务判断
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// 用户的原话：
-//   「学习通千变万化，单纯使用脚本增加分支逻辑，永远不可能解决所有的边界情况，
-//     只有加入大模型这个大脑才能解决所有的问题。」
-//
-// 所以本文件的分工是**绝对的**：
-//
-//   脚本（lib/）= 传感器 + 执行器
-//     · observe.mjs   只"看"：把页面上有什么如实读出来
-//     · act.mjs       只"做"：执行一个明确动作
-//     · inventory.mjs 把"看"的结果整理成"这一页有什么"
-//
-//   大模型 = 唯一的决策者
-//     · 决定进哪个章节、翻到哪一页
-//     · 决定这一页先做哪个任务点、用什么方式做
-//     · 决定遇到不确定的东西怎么办
-//
-// 每个工具**要么报告事实，要么执行一个明确指令**。
-// 没有一个工具含 "if 是视频就…else if 是测验就…else 不处理" 这种分支。
-//
-// 工具清单（9 个）：
-//   看：cx_open  cx_courses  cx_chapters  cx_enter  cx_page  cx_shot  cx_progress
-//   做：cx_tab   cx_do
+/**
+ * dsh-xuexi —— 网课模式
+ *
+ * ┌───────────────────────────────────────────────────────────────────────┐
+ * │  这个插件只提供「手和眼」。判断、决策、应对没见过的情况，全是大模型的事。 │
+ * └───────────────────────────────────────────────────────────────────────┘
+ *
+ * 为什么这么设计（一次真实事故）：旧版把「某个网站长什么样」写死在工具里，
+ * 又把「按什么顺序调工具」写进提示词。用户换了一个学校的账号 ——
+ * 页面结构不一样，专用工具全部失效，模型原地打转十分钟，最后要用户手动帮它开页面。
+ *
+ * 根因不是模型笨，是**它的退路被堵死了**。所以 v2 只做三件事：
+ *
+ *   ① 工具只认识屏幕：对账清单、指纹、编号，全部从屏幕上现读
+ *   ② 格式错在动手之前拦住，且零副作用（ARG / USAGE 失败 = 页面一下都没被碰过）
+ *   ③ 大脑永远有退路：截图 → 列能点的 → 点一个看变化
+ *
+ * 15 个工具分三类：
+ *   眼（5）  eye_open / eye_see / eye_list / eye_shot / eye_check
+ *   手（6）  hand_click / hand_pick / hand_write / hand_scroll / hand_goto / hand_tab
+ *   必要（4）hand_play / hand_submit / hand_note / hand_verdict
+ *
+ * 必要那四个留着不是因为它们"聪明"，而是因为只有两类动作需要代码兜住：
+ *   ① 涉及铁律（播放不能被作弊：原速 1x / 不拖拽 / 不伪造心跳）
+ *   ② 做错回不了头（交答案，一般不给重做）
+ */
 
-import { writeFileSync, readFileSync, mkdirSync } from 'node:fs'
-import { launchBrowser, ensureWorkTab, listPages } from './lib/browser.mjs'
-import * as OBS from './lib/observe.mjs'
-import * as ACT from './lib/act.mjs'
-import { inventory, inventoryAll } from './lib/inventory.mjs'
-import * as CHK from './lib/check.mjs'
-import * as ST from './lib/state.mjs'
+import { readFileSync, mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
-export const name = 'dsh-chaoxing'
+import * as B from './lib/browser.mjs'
+import * as SEE from './lib/see.mjs'
+import * as HAND from './lib/hand.mjs'
+import * as NT from './lib/note.mjs'
+import * as GATE from './lib/gate.mjs'
+import { checkArgs } from './lib/args.mjs'
 
-// 只把 tools 作为硬依赖。systemPrompt 运行时软获取（见 apply）：
-// 注册表挂载预设时会审计每一行，任何一行启动失败都会让整个预设被标记「加载失败」，
-// 所以本插件绝不能成为那个单点故障。
-export const inject = ['tools']
-
-const PROMPT_PATH = new URL('./prompts/chaoxing-mode.md', import.meta.url)
-const PROMPT_TEXT = readFileSync(PROMPT_PATH, 'utf8')
-  .replace(/\{\{(?!(?:cwd|model|provider)\}\})/g, '{ {')
+export const name = 'dsh-xuexi'
 
 const DEFAULT_PORT = 9222
-const DEFAULT_PROFILE = ST.STATE_DIR.replace(/\\/g, '/') + '/browser-profile'
+const DEFAULT_PROFILE = join(NT.STATE_DIR, 'browser-profile')
 
-// ── 会话句柄（纯基建，不含任何业务判断）────────────────────────────────────
-let session = { browser: null, work: null, course: null, section: null, tabs: [], tree: null, treeAt: 0, verdicts: [] }
-let running = false   // 串行闸门：学习通禁止同账号并行
+const PROMPT_TEXT = (() => {
+  try { return readFileSync(new URL('./prompts/xuexi-mode.md', import.meta.url), 'utf8') }
+  catch (e) { return `# 网课模式\n\n（提示词文件读不到：${String(e?.message ?? e)}）\n` }
+})()
 
-/**
- * 取章节树（带缓存）。
- *
- * 为什么要缓存：readChapterTree 每次都会 goto 章节列表页并重新解析
- * —— 一次 cx_enter 要重载两个页面（课程页 + 章节列表页），实测约 30 秒。
- * 而「chapterId ↔ 小节」这个映射**不会变**，没有理由每次都重读。
- *
- * ⚠️ 缓存的只有**结构**，进度数字会随着刷课变化 —— 所以返回里会标 __cached，
- *    并且 cx_chapters 每次都强制重读（看进度必须新鲜）。
- */
-async function getTree(work, course, { force = false, maxAgeMs = 30 * 60_000 } = {}) {
-  const fresh = session.tree
-    && session.tree.courseName === course.name
-    && Date.now() - session.treeAt < maxAgeMs
-  if (!force && fresh) return { ...session.tree.data, __cached: true, __cachedAgeMs: Date.now() - session.treeAt }
+// ═════════════════════════════════════════════════════════════════════════════
+//  出口：把返回值清洗成「无损 JSON」
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// DSH 会校验工具返回值能否**无损**转成 JSON，不能就整个调用失败：
+//   tool "xxx" returned invalid output: value is not lossless JSON
+// JS 里一堆东西 JSON 表达不了：undefined / NaN / Infinity / 函数 / BigInt / Date…
+// 只要返回对象里**任何一个字段**踩到，整条调用就废了 —— 与其逐个字段防，不如出口统一洗。
 
-  const tree = await OBS.readChapterTree(work, course)
-  session.tree = { courseName: course.name, data: tree }
-  session.treeAt = Date.now()
-  return tree
-}
-
-/**
- * 在课程列表里找到指定课程 —— **所有需要课程列表的地方统一走这里**。
- *
- * ⚠️ 为什么必须统一（实测事故 2026-10-07 第二次）：
- *
- *   课程列表在一个跨域 iframe 里，`goto` 之后**要等它渲染完**（实测约 3.5 秒）。
- *   `cx_courses` 等了（先 waitForCourseListStable），所以能列出 25 门课；
- *   而 `cx_chapters` / `cx_enter` 没等 —— 于是**每次读到空列表**，
- *   报 `COURSE_NOT_FOUND` 且 `available: []`。
- *
- *   后果是连锁的：大模型拿不到章节结构，就不知道哪些小节还有任务点，
- *   只能一节一节 `cx_nav` 翻过去看 —— 而它翻的前几节刚好都已经做完了，
- *   于是用户看到的就是"一直在翻页、什么都不干"，最后当成卡死中断。
- *
- * 顺带修了标题匹配：课程名可能带空格或后缀差异，严格 `===` 太脆，
- * 现在按「完全相等 → 去空格相等 → 包含」逐级退让。
- */
-async function resolveCourse(work, name) {
-  await work.goto(OBS.HOME_URL, { timeoutMs: 30_000 })
-  try { await OBS.waitForCourseListStable(work) } catch { /* 拿不到稳定信号也继续试着读 */ }
-
-  let all = await OBS.readCourseList(work).catch(() => [])
-  if (!all.length) {                              // 还空就再给它一点时间
-    await new Promise((r) => setTimeout(r, 2500))
-    all = await OBS.readCourseList(work).catch(() => [])
-  }
-
-  if (!name) return { all, course: all[0] ?? null }
-
-  const norm = (s) => String(s ?? '').replace(/\s+/g, '').trim()
-  const want = norm(name)
-  const course =
-    all.find((c) => c.name === name) ??
-    all.find((c) => norm(c.name) === want) ??
-    all.find((c) => norm(c.name).includes(want)) ??
-    all.find((c) => want.includes(norm(c.name)) && norm(c.name)) ??
-    null
-  return { all, course }
-}
-
-async function getWork(ctx, { relaunch = false, preferForeground = false } = {}) {
-  if (!relaunch && !preferForeground && session.browser && session.work) {
-    try {
-      await listPages(session.browser)
-      // ⚠️ 光确认"浏览器还在"不够 —— 浏览器活着**不代表页面会话没死**。
-      //
-      //    实测事故：CDP session 失效后 listPages 照样成功（它是浏览器级命令），
-      //    于是每次都把同一个**死句柄**返回出去，每一条命令都报
-      //    "Session with given id not found"，连 cx_open 都救不回来。
-      //
-      //    现在多做一次页面级存活探测：底层会顺手重连一次，重连还失败才重建句柄。
-      if (await session.work.alive()) return session.work
-      session.work = null
-    } catch { session.browser = null; session.work = null }
-  }
-  const state = ST.loadState()
-  const browser = await launchBrowser({
-    port: state.browser?.port ?? DEFAULT_PORT,
-    profileDir: state.browser?.profileDir ?? DEFAULT_PROFILE,
-  })
-  // ★ preferForeground：重新挑一次标签页，**优先用户在看的那个**。
-  //
-  //   实测事故（用户直接指出的）：用户自己在浏览器里翻到了「马原章节任务点」，
-  //   然后叫 DSH 开始；DSH 却认准了自己状态里记的那个旧标签页（还停在课程页），
-  //   把**它**导航到了章节页 —— 用户翻好的那一页从头到尾没被看见。
-  //
-  //   所以 cx_open（明确的"从这儿开始"）会带 preferForeground: true，
-  //   重新绑定；干活中途不动，免得把正在播的视频切走。
-  const work = await ensureWorkTab(browser, {
-    targetId: (relaunch || preferForeground) ? null : state.browser?.workTargetId,
-    preferForeground: preferForeground || relaunch,
-  })
-  // 每次都把实际用的标签页写回状态：
-  // ensureWorkTab 可能复用了"用户正在用的那一页"（而不是记录里的旧 id），
-  // 不同步的话下次又会找错。
-  if (state.browser?.workTargetId !== work.targetId) {
-    state.browser = {
-      port: state.browser?.port ?? DEFAULT_PORT,
-      profileDir: state.browser?.profileDir ?? DEFAULT_PROFILE,
-      workTargetId: work.targetId,
-    }
-    ST.saveState(state)
-  }
-  session.browser = browser
-  session.work = work
-  return work
-}
-
-const objOut = {
-  schema: { type: 'object', additionalProperties: true },
-  render: (_args, value) => {
-    // ★ 关键修复：把截图**真的交给模型看**，而不是只给一个文件路径。
-    //
-    //   实测事故（2026-10-08 发现，最严重的一个）：
-    //   旧版 cx_shot 只返回 `{ file: "…png" }` —— 内容是纯文本，
-    //   模型**根本看不到图**。于是它只能去读被字体混淆的 DOM 硬猜，
-    //   日志里它自己写了「题干+选项都被替换字混淆，但可用上下文语义还原
-    //   （圪盾=矛盾、圧性=属性）」—— 那就是在猜。猜对是运气，不是能力。
-    //
-    //   DSH 的 ContentBlock 支持真正的图片块：
-    //     { type: 'image', attachment: ImageAttachmentRef }
-    //   ImageAttachmentRef = { attachmentId, mediaType, bytes, width, height, name? }
-    //
-    //   实现方式：截图工具把附件的 ref 放进返回值的 `__images`（内部约定），
-    //   这里取出来渲染成图片块，同时把 `__images` 从给模型看的文字里摘掉。
-    let v = value
-    let images = []
-    if (v && typeof v === 'object' && !Array.isArray(v) && Array.isArray(v.__images)) {
-      images = v.__images
-      const { __images, ...rest } = v
-      v = rest
-    }
-    const blocks = [{
-      type: 'text',
-      text: typeof v === 'string' ? v : JSON.stringify(v, null, 2),
-    }]
-    for (const attachment of images) {
-      if (attachment && attachment.attachmentId) blocks.push({ type: 'image', attachment })
-    }
-    return blocks
-  },
-}
-
-/** 串行闸门的统一包装：任何"做"的动作都不允许并发 */
-function serial(fn) {
-  return async (args) => {
-    if (running) return { ok: false, error: 'BUSY', hint: '已有任务在跑。学习通禁止同账号并行，请等它结束。' }
-    running = true
-    try { return await fn(args) }
-    finally { running = false }
-  }
-}
-
-/** 截图存盘 + 注册成附件 —— cx_shot 和 cx_do(read) 共用，避免两处逻辑漂移 */
-async function takeShot(ctx, work, { full = false, label = 'shot', clip = null } = {}) {
-  const dir = ST.shotsDir()
-  mkdirSync(dir, { recursive: true })
-  const attachments = ctx.get('attachments')
-
-  // ★ 把它**当成附件存进 DSH**，这样 objOut.render 才能渲染成真正的图片块。
-  //   只写文件、不给 ref 的话，模型看到的永远只是一行路径 —— 那就等于没截图。
-  //
-  //   ⚠️ 整页 PNG 可能有几 MB，超过附件的尺寸/体积上限就会被拒。
-  //      所以留一条降级路：PNG 存不进去就改用 JPEG 重截一次（体积通常小一个数量级）。
-  const attempt = async (format, quality) => {
-    const buf = clip
-      ? await work.screenshot({ clip, format, quality })
-      : (full ? await work.screenshotFull({ format, quality }) : await work.screenshot({ format, quality }))
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-    const safe = String(label).replace(/[^\w.-]+/g, '_')
-    const ext = format === 'jpeg' ? 'jpg' : 'png'
-    const file = `${dir}\\chaoxing-${safe}-${stamp}.${ext}`
-    writeFileSync(file, buf)
-
-    let image = null
-    let err = null
-    if (attachments?.saveImage) {
-      try {
-        image = await attachments.saveImage({
-          data: new Uint8Array(buf),
-          mediaType: format === 'jpeg' ? 'image/jpeg' : 'image/png',
-          name: `chaoxing-${safe}.${ext}`,
-        })
-      } catch (e) { err = e }
-    }
-    return { file, bytes: buf.length, type: format === 'jpeg' ? 'image/jpeg' : 'image/png', image, err }
-  }
-
-  let r = await attempt('png')
-  // 只有当"附件服务在、但拒了这张图"时才降级重截 —— 服务本来就不可用就没什么好重试的
-  if (!r.image && attachments?.saveImage) {
-    const j = await attempt('jpeg', 78).catch(() => null)
-    if (j?.image) {
-      r = { ...j, downscaled: true, note: `整页 PNG（${r.bytes} B）存不进附件，已改用 JPEG` }
-    }
-  }
-
-  const { err, ...rest } = r
-  if (!r.image && err) console.error('[dsh-chaoxing] saveImage 失败:', String(err?.message ?? err))
-  return rest
-}
-
-/**
- * 把返回值清洗成「无损 JSON」。
- *
- * 为什么必须有：DSH 会校验工具返回值能否**无损**转成 JSON，不能就整个调用失败，
- * 报 `tool "cx_xxx" returned invalid output: value is not lossless JSON`。
- *
- * JS 里有一堆东西 JSON 表达不了：`undefined`、`NaN`、`Infinity`、函数、Symbol、BigInt、Date…
- * 只要返回对象里**任何一个字段**踩到，整条工具调用就废了 ——
- * 实测事故里 `remaining: undefined` 就是这么把 cx_courses 彻底打死的。
- *
- * 与其逐个字段去防，不如在出口统一清洗一次。
- */
 function toLossless(v, seen = new Set()) {
   if (v === null || v === undefined) return null
   const t = typeof v
@@ -291,57 +76,122 @@ function toLossless(v, seen = new Set()) {
   return String(v)
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+//  出口：把截图**真的交给模型看**
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// 实测事故（最严重的一个）：旧版截图工具只返回 { file: "…png" } —— 纯文本。
+// 模型**根本看不到图**，于是只能去读被字体搅过的 DOM 硬猜，
+// 日志里它自己写了「可用上下文语义还原」。猜对是运气，不是能力。
+//
+// DSH 的 ContentBlock 支持真正的图片块。实现：截图工具把附件 ref 放进 `__images`
+// （内部约定），这里渲染成图片块，同时把 `__images` 从给模型看的文字里摘掉。
+
+const objOut = {
+  schema: { type: 'object', additionalProperties: true },
+  render: (_args, value) => {
+    let v = value
+    let images = []
+    if (v && typeof v === 'object' && !Array.isArray(v) && Array.isArray(v.__images)) {
+      images = v.__images
+      const { __images, ...rest } = v
+      v = rest
+    }
+    const blocks = [{
+      type: 'text',
+      text: typeof v === 'string' ? v : JSON.stringify(v, null, 2),
+    }]
+    for (const attachment of images) {
+      if (attachment && attachment.attachmentId) blocks.push({ type: 'image', attachment })
+    }
+    return blocks
+  },
+}
+
+/** 截图存盘 + 注册成附件 —— eye_shot 用 */
+async function takeShot(ctx, work, { full = false, label = 'shot', clip = null } = {}) {
+  const dir = NT.shotsDir()
+  mkdirSync(dir, { recursive: true })
+  const attachments = ctx.get?.('attachments')
+
+  const attempt = async (format, quality) => {
+    const buf = clip
+      ? await work.screenshot({ clip, format, quality })
+      : (full ? await work.screenshotFull({ format, quality }) : await work.screenshot({ format, quality }))
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const safe = String(label).replace(/[^\w.-]+/g, '_')
+    const ext = format === 'jpeg' ? 'jpg' : 'png'
+    const file = join(dir, `xuexi-${safe}-${stamp}.${ext}`)
+    writeFileSync(file, buf)
+
+    let image = null
+    let err = null
+    if (attachments?.saveImage) {
+      try {
+        image = await attachments.saveImage({
+          data: new Uint8Array(buf),
+          mediaType: format === 'jpeg' ? 'image/jpeg' : 'image/png',
+          name: `xuexi-${safe}.${ext}`,
+        })
+      } catch (e) { err = e }
+    }
+    return { file, bytes: buf.length, type: format === 'jpeg' ? 'image/jpeg' : 'image/png', image, err }
+  }
+
+  let r = await attempt('png')
+  // 只有"附件服务在、但拒了这张图"时才降级重截；服务本来就不可用就没什么好重试的
+  if (!r.image && attachments?.saveImage) {
+    const j = await attempt('jpeg', 78).catch(() => null)
+    if (j?.image) r = { ...j, downscaled: true, note: `整张 PNG（${r.bytes} B）存不进附件，已改用 JPEG` }
+  }
+
+  const { err, ...rest } = r
+  if (!r.image && err) console.error('[dsh-xuexi] saveImage 失败:', String(err?.message ?? err))
+  return rest
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+
 export function apply(ctx, config = {}) {
   const port = config.port ?? DEFAULT_PORT
 
-  /**
-   * 这次会话的工作区在哪？
-   *
-   * 链路（查过 DSH 的 Service 契约确认的）：
-   *   ToolDefinition.execute(args, exec: ToolRunContext)
-   *     exec.agent.id                          → SessionId
-   *     ctx.sessions.get(id).header.cwd        → ★ 工作区绝对路径
-   *
-   * 拿到之后，过程文件（截图/进度）就落在 <工作区>/.chaoxing/ 里，
-   * 而不是乱丢到用户家目录。
-   *
-   * ⚠️ 全程 try/catch —— 预设作用域的 ctx 未必能拿到 host 服务，
-   *    拿不到就退回机器目录，绝不让它成为故障点。
-   */
+  /** 这次会话的状态（浏览器句柄 + 复核登记簿） */
+  const session = { browser: null, work: null, verdicts: {}, lastToken: null, busy: false }
+
+  // ── 过程文件落在哪：<工作区>/.xuexi/ ──────────────────────────────────────
+  //
+  // 用户的意见（对）：DSH 对话一定有工作区，干活产生的过程文件就该留在工作区里。
+  // 链路：ToolDefinition.execute(args, exec) → exec.agent.id → ctx.sessions.get(id).header.cwd
+  // ⚠️ 全程 try/catch —— 拿不到就退回机器目录，绝不让它成为故障点。
   const _dirBySession = new Map()
   function applyOutputDir(exec) {
     try {
       const id = exec?.agent?.id
-      if (id && _dirBySession.has(id)) { ST.setOutputDir(_dirBySession.get(id), { isWorkspace: true }); return }
+      if (id && _dirBySession.has(id)) { NT.setOutputDir(_dirBySession.get(id), { isWorkspace: true }); return }
       const cwd = id ? (ctx.get?.('sessions')?.get?.(id)?.header?.cwd ?? null) : null
-      const dir = ST.resolveOutputDir(cwd)
+      const dir = NT.resolveOutputDir(cwd)
       if (id) _dirBySession.set(id, dir)
-      ST.setOutputDir(dir, { isWorkspace: Boolean(cwd) })
+      NT.setOutputDir(dir, { isWorkspace: Boolean(cwd) })
     } catch { /* 退回默认目录，不影响功能 */ }
   }
 
-  // ── 系统提示词（软获取，拿不到只警告，不让整个预设挂掉）──────────────────
+  // ── 系统提示词 ────────────────────────────────────────────────────────────
   const systemPrompt = ctx.get?.('systemPrompt')
   if (systemPrompt?.section) {
-    ctx.effect(() => systemPrompt.section({ name: 'chaoxing:mode-prompt', order: 120, text: PROMPT_TEXT }))
+    ctx.effect(() => systemPrompt.section({ name: 'xuexi:mode-prompt', order: 120, text: PROMPT_TEXT }))
   } else {
     const warn = ctx.logger?.warn?.bind(ctx.logger) ?? console.warn
-    warn('[dsh-chaoxing] systemPrompt 不可用，模式提示词未注入（工具仍可用）')
+    warn('[dsh-xuexi] systemPrompt 不可用，模式提示词未注入（工具仍可用）')
   }
 
-  // ── 主脑闸门：★ 浏览器工具只允许「主脑」一个 Agent 操作 ──────────────────
+  // ── 角色闸门：浏览器只能由「主脑」一个 Agent 操作 ─────────────────────────
   //
-  // 为什么必须有（用户定的）：
-  //   学习通**禁止同账号并行**。如果主脑开的子智能体也能调 cx_click / cx_do，
+  // 为什么必须是**结构约束**而不是靠提示词求它自觉：
+  //   同一个账号禁止并行操作。主脑开的复核员如果能调 hand_click / hand_pick，
   //   两个 Agent 同时动同一个浏览器 → 切页互相打断、播放被打断、状态彻底错乱。
-  //   所以"只有主脑能碰浏览器"必须是**结构约束**，不能只靠提示词求它自觉。
   //
-  // 判定方式用**结构**而不是记 ID（记 ID 在换会话后会失效、把主脑也挡住）：
-  //   ctx.agents.isOwnedBy(agentId, other)  —— 这个 agent 是不是 other 的子体？
-  //   是子体 → 不是主脑 → 拒绝。
-  //
-  // 子智能体不需要 cx_* 里的任何东西：
-  //   读图用全局工具 read_image；需要更清楚的截图就反馈给主脑（见提示词的判题员协议）。
+  // 判定用**结构**而不是记 ID（记 ID 换会话会失效，把主脑也挡住）：
+  //   ctx.agents.isOwnedBy(agentId, other) —— 这个 agent 是不是 other 的子体？
   function isSubagent(agentId) {
     if (!agentId) return null
     try {
@@ -349,1113 +199,772 @@ export function apply(ctx, config = {}) {
       if (!agents?.list || !agents?.isOwnedBy) return null   // 判断不了
       for (const a of agents.list()) {
         if (a.id === agentId) continue
-        try { if (agents.isOwnedBy(agentId, a)) return true } catch { /* 这一条查不动，继续 */ }
+        try { if (agents.isOwnedBy(agentId, a)) return true } catch { /* 这条查不动，继续 */ }
       }
       return false
     } catch { return null }
   }
 
-  // 判断不了时的退路：先到先得。cx_open 会重新认领，所以换会话不会把自己锁死。
+  // 判断不了时的退路：先到先得。eye_open 会重新认领，所以换会话不会把自己锁死。
   let fallbackOwner = null
 
-  const DENY_MSG = {
-    ok: false,
-    error: 'NOT_THE_COMMANDER',
-    hint: '浏览器只能由「主脑」一个 Agent 操作 —— 学习通禁止同账号并行，'
-      + '多个 Agent 同时动浏览器会互相打断、状态错乱。\n'
-      + '如果你是子智能体（判题员）：你不该调用任何 cx_* 工具。'
-      + '你的活只是 read_image 读图判题，然后返回 JSON；'
-      + '需要更清楚的截图就返回 {"__need_shot": ["第3题"]}，由主脑去截。',
+  const DENY_MAIN = {
+    ok: false, category: 'TOOL', error: 'NOT_THE_LEAD',
+    hint: '浏览器只能由「主脑」一个 Agent 操作 —— 同账号并行会互相打断、状态错乱。\n'
+      + '如果你是复核员：你不该调用任何手眼工具。你手上只有 read_image 和 hand_verdict。\n'
+      + '看不清就回 {"__need_shot":[编号]}，主脑会补一张特写给你。',
+  }
+  const DENY_REVIEWER = {
+    ok: false, category: 'USAGE', error: 'LEAD_CANNOT_JUDGE',
+    hint: 'hand_verdict 是给**复核员**登记结论用的，主脑不该调它。\n'
+      + '你是主脑：自己也要读图定一份，在页面上用 hand_pick / hand_write 弄好 —— 不用登记。\n'
+      + '你的答案不在任何登记表里，它就在页面上；eye_check 会拿页面和两份登记比。',
   }
 
-  function commanderGuard(def, exec) {
+  function roleGuard(defName, exec) {
     const id = exec?.agent?.id
-    if (!id) return null                      // 不是 Agent 调的（测试脚本等）→ 放行
+    if (!id) return null                       // 不是 Agent 调的（测试脚本等）→ 放行
     const sub = isSubagent(id)
-    if (sub === true) return DENY_MSG
-    if (sub === null) {                       // 结构判断不可用 → 先到先得
-      if (fallbackOwner && fallbackOwner !== id) return DENY_MSG
+
+    if (defName === 'hand_verdict') {          // ★ 唯一反过来的一条：只给复核员
+      if (sub === true) return null
+      if (sub === null) {
+        // 结构判断不可用：谁先调 eye_open 谁是主脑
+        if (!fallbackOwner || fallbackOwner === id) return DENY_REVIEWER
+        return null
+      }
+      return DENY_REVIEWER
+    }
+
+    if (sub === true) return DENY_MAIN
+    if (sub === null) {
+      if (fallbackOwner && fallbackOwner !== id) return DENY_MAIN
       if (!fallbackOwner) fallbackOwner = id
     }
     return null
   }
 
-  // 统一入口：每次工具调用先做两件事 ——
-  //   ① 按当前会话 cwd 定位过程文件目录（截图/进度落工作区）
-  //   ② 主脑闸门（子智能体不许碰浏览器）
-  // 这样"文件放哪"和"谁能动浏览器"都只在一处决定。
+  // ── 拿浏览器 + 绑标签页 ───────────────────────────────────────────────────
+  async function getWork({ targetId = null, relaunch = false, preferForeground = false } = {}) {
+    if (!targetId && !relaunch && !preferForeground && session.browser && session.work) {
+      try {
+        await B.listPages(session.browser)     // 浏览器还活着吗
+        // ⚠️ 光确认"浏览器还在"不够 —— 浏览器活着不代表页面会话没死。
+        //    实测事故：CDP session 失效后 listPages 照样成功（它是浏览器级命令），
+        //    于是每次都把同一个**死句柄**返回出去，每条命令都报
+        //    "Session with given id not found"，连 eye_open 都救不回来。
+        if (await session.work.alive()) return session.work
+        session.work = null
+      } catch { session.browser = null; session.work = null }
+    }
+
+    const state = NT.loadState()
+    const browser = await B.launchBrowser({
+      port: state.browser?.port ?? port,
+      profileDir: state.browser?.profileDir ?? DEFAULT_PROFILE,
+    })
+    const work = await B.ensureWorkTab(browser, {
+      targetId: targetId ?? ((relaunch || preferForeground) ? null : state.browser?.workTargetId),
+      preferForeground: preferForeground || relaunch,
+    })
+    // 每次都把实际用的标签页写回状态：ensureWorkTab 可能复用了"用户在用的那一页"
+    if (state.browser?.workTargetId !== work.targetId) {
+      state.browser = {
+        port: state.browser?.port ?? port,
+        profileDir: state.browser?.profileDir ?? DEFAULT_PROFILE,
+        workTargetId: work.targetId,
+      }
+      NT.saveState(state)
+    }
+    session.browser = browser
+    session.work = work
+    return work
+  }
+
+  /** 浏览器里开着哪几个标签页（形状按底层来，这里只做防守式映射） */
+  async function tabsOf(browser) {
+    const pages = await B.listPages(browser).catch(() => [])
+    return (pages ?? []).map((p, i) => ({
+      i,
+      id: p.targetId ?? p.id ?? null,
+      url: String(p.url ?? ''),
+      title: p.title ?? null,
+      blank: !p.url || /^about:/.test(String(p.url)),
+      active: p.visible === true || p.active === true,
+    }))
+  }
+
+  /** 统一的错误包装：分清"是世界的问题"还是"工具的问题" */
+  function wrapError(e) {
+    const msg = String(e?.message ?? e ?? '未知错误')
+    const isTool = /Session with given id|Cannot find context|Execution context was destroyed|Target closed|Session closed|Detached while handling command|ECONNREFUSED|socket|WebSocket|超时|timed? ?out/i.test(msg)
+    return {
+      ok: false,
+      category: isTool ? 'TOOL' : 'WORLD',
+      error: msg.slice(0, 300),
+      hint: isTool
+        ? '浏览器/连接出问题了。等一下再试；还不行就用 eye_open 重新接管。'
+        : '参数没问题，是屏幕上这件事没做成。**别改调用** —— 退回三件万能事：'
+          + 'eye_shot 看一眼 → eye_list 列出所有能点的 → hand_click 点一个看页面怎么变。',
+    }
+  }
+
+  // ── 统一注册：每个工具都走这一条路 ────────────────────────────────────────
+  //
+  //   ① 定位过程文件目录
+  //   ② ★ 先验格式 —— 页面一下都不许被碰过
+  //   ③ 角色闸门
+  //   ④ 干活（定义在 def.run 里）
+  //   ⑤ 出口清洗
   const reg = (def) => ctx.effect(() => ctx.tools.register({
-    ...def,
+    name: def.name,
+    description: def.description,
+    parameters: def.parameters,
+    timeoutMs: def.timeoutMs,
+    isConcurrencySafe: def.isConcurrencySafe,
     output: objOut,
-    execute: async (args, exec) => {
+    async execute(args, exec) {
       applyOutputDir(exec)
 
-      // ★ 唯一的例外：cx_verdict 只给**判题员**用，所以闸门正好反过来。
-      //   它不是浏览器操作，只是"登记我的判题结论"，给主脑用没意义。
-      if (def.name === 'cx_verdict') {
-        const id = exec?.agent?.id
-        if (id) {
-          const sub = isSubagent(id)
-          if (sub === false) {
-            return {
-              ok: false, error: 'COMMANDER_CANNOT_JUDGE',
-              hint: 'cx_verdict 是给**判题员**登记结论用的，主脑不该调它。\n'
-                + '你是主脑：自己也读图定一份答案，然后在脑子里和判题员比 —— 不用登记。',
-            }
+      // ② 先验格式。ARG / USAGE 失败 = 页面一下都没被碰过，模型改一下调用就能重来。
+      const chk = checkArgs(def.name, args)
+      if (!chk.ok) return chk
+
+      // ③ 角色闸门
+      const denied = roleGuard(def.name, exec)
+      if (denied) return denied
+      if (def.name === 'eye_open') fallbackOwner = exec?.agent?.id ?? fallbackOwner
+
+      // ④ + ⑤
+      const run = async () => {
+        if (def.serial && session.busy) {
+          return {
+            ok: false, category: 'TOOL', error: 'BUSY',
+            hint: '已有任务在跑。同一个账号禁止并行（会互相顶、进度作废），等它结束再来。',
           }
         }
-        return toLossless(await def.execute(args, exec))
+        if (def.serial) session.busy = true
+        try { return toLossless(await def.run(chk.args, exec)) }
+        catch (e) { return wrapError(e) }
+        finally { if (def.serial) session.busy = false }
       }
-
-      const denied = commanderGuard(def, exec)
-      if (denied) return denied
-      if (def.name === 'cx_open') fallbackOwner = exec?.agent?.id ?? fallbackOwner
-      // ★ 出口统一清洗：任何 undefined / NaN / Infinity / 函数 都会让
-      //   DSH 判 "value is not lossless JSON" 而整条失败，这里一次性兜住。
-      return toLossless(await def.execute(args, exec))
+      return run()
     },
   }))
 
   // ═════════════════════════════════════════════════════════════════════════
-  //  看
+  //  眼（5）—— 只报事实
   // ═════════════════════════════════════════════════════════════════════════
 
   reg({
-    name: 'cx_open',
-    description: '接管浏览器，并**绑定到你正在看的那个学习通标签页**。返回登录状态和你以前的笔记。'
-      + '那一页若已在学习通上，**不会导航、不会动它**。未登录时请用户扫码（绝不代填账号密码）。幂等。',
-    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    name: 'eye_open',
+    description:
+      '接管浏览器，并**绑定到用户正在看的那个标签页**。返回开着哪几个标签页、我接的是哪个、'
+      + '登录没有、以及以前记下的笔记。\n'
+      + '★ 不会导航用户那一页 —— 没登录时请用户扫码（绝不代填账号密码）。幂等。',
+    parameters: {
+      type: 'object',
+      properties: { tab: { type: 'string', description: '要接哪个标签页的 id（可选，不给就接用户正在看的那个）' } },
+      additionalProperties: false,
+    },
     isConcurrencySafe: () => true,
-    async execute() {
-      // ★ preferForeground：cx_open 是明确的"从这儿开始"，要重新绑定到
-      //   **用户正在看的那个学习通标签页**，而不是我们记着的旧标签。
-      const work = await getWork(ctx, { preferForeground: true })
-      const here = await work.eval('location.href').catch(() => null)
+    async run({ tab }) {
+      const work = await getWork({ targetId: tab ?? null, preferForeground: !tab })
+      const login = await SEE.loginState(work).catch(() => ({ onLoginPage: null, needsUser: false }))
+      const tabs = await tabsOf(session.browser)
+      const bound = tabs.find((t) => t.id === work.targetId) ?? null
+      const url = await work.eval('location.href').catch(() => null)
+      const title = await work.eval('document.title').catch(() => null)
 
-      // ★ 只在"不在学习通上"时才导航。
-      //
-      //   旧实现无条件 `goto(HOME_URL)` —— 结果就是用户自己翻好了
-      //   马原章节任务点，cx_open 一来把它冲回首页，用户白翻。
-      //   实测事故 2026-10-08。
-      const onChaoxing = /chaoxing\.com/.test(here || '')
-      if (!onChaoxing) await work.goto(OBS.HOME_URL, { timeoutMs: 30_000 })
+      NT.setCurrent({ url, title })
 
-      const loggedIn = await OBS.isLoggedIn(work)
-      const finalUrl = await work.eval('location.href').catch(() => here)
+      return {
+        ok: true,
+        port,
+        url, title,
+        loggedIn: login.onLoginPage === false ? true : (login.onLoginPage === true ? false : null),
+        needsUser: Boolean(login.needsUser),
+        bound: bound ?? { id: work.targetId, url, title },
+        tabs,
+        notes: NT.noteDigest(10),
+        next: tab
+          ? '已接到你指定的标签页。'
+          : '已连上你正在看的这一页 —— **没动它**。先 eye_see 看这一页有什么。',
+      }
+    },
+  })
 
-      // ★ 自检信息：这些都是"只在真机上才知道"的事实，塞进返回值里，
-      //   排查时一眼就能看出是哪一层坏了，不用再来回猜。
-      const attachmentsRef = ctx.get('attachments')
-      const allTabs = await listPages(session.browser).catch(() => [])
-      const diag = {
-        // 图片能不能真的送到模型 —— 全靠这个服务（see objOut.render）
-        attachmentsAvailable: !!attachmentsRef?.saveImage,
-        // 这次绑的是哪一个页面、怎么选的
-        boundTab: {
-          targetId: work.targetId,
-          followedUser: !!work.__followedUser,   // true = 跟的是你看的那页
-          reused: !!work.__reusedWorkTab,
-          owns: !!work.__ownsWorkTab,
+  reg({
+    name: 'eye_see',
+    description:
+      '★ 这一页有什么：把所有「要处理的地方」列出来，每处标明是**挑**（pick）还是**写**（write）'
+      + '还是**按钮**还是**媒体**，有几个选项、现在选了什么、有没有"已完成"标记。\n'
+      + '只报事实，不判断"这是什么题、该做什么"。读题的文字必须看图（DOM 文字可能被搅过）。',
+    parameters: {
+      type: 'object',
+      properties: { full: { type: 'boolean', description: 'true = 连整页一起看（默认只看当前这一屏）' } },
+      additionalProperties: false,
+    },
+    isConcurrencySafe: () => true,
+    async run({ full }) {
+      const work = await getWork()
+      const r = await SEE.readAreas(work, { full })
+      const areas = r.areas ?? []
+      return {
+        ok: true,
+        url: r.url, title: r.title,
+        frames: r.frames ?? [],
+        areas,
+        counts: {
+          pick: areas.filter((a) => a.kind === 'pick').length,
+          write: areas.filter((a) => a.kind === 'write').length,
+          button: areas.filter((a) => a.kind === 'button').length,
+          media: areas.filter((a) => a.kind === 'media').length,
         },
-        // 浏览器里现在有几个标签页（看有没有多出来的空白页）
-        tabs: allTabs.map((t) => {
-          const u = t.url || ''
-          return { id: t.targetId.slice(0, 8), blank: u === 'about:blank' || u === '', url: u.slice(0, 80) }
-        }),
-      }
-
-      return {
-        ok: true, port, loggedIn,
-        url: finalUrl,
-        followedUserTab: !!work.__followedUser,
-        // ★ 把「以前学到的」带回来 —— 这就是学习
-        notes: ST.noteDigest(10),
-        diagnostics: diag,
-        next: loggedIn
-          ? (onChaoxing
-            ? `已连上你正在看的这一页（${String(finalUrl).slice(0, 70)}）—— **没有动它**。`
-              + '想先看课程结构就 cx_chapters，想直接开刷就 cx_page。'
-            : '已登录 → cx_courses 列课程')
-          : '请在浏览器窗口用学习通 App 扫码，登录后再调一次 cx_open',
+        // 对账清单：交之前要复核的那几处（只有 pick），原样发给复核员
+        ledger: GATE.buildLedger(areas),
+        hint: areas.length
+          ? '一处一处处理。挑的用 hand_pick，写的用 hand_write，媒体用 hand_play。'
+          : '这一页没看到要处理的地方 —— 要么类型不对（用 eye_list 看看有什么能点的），要么已经做完了。',
       }
     },
   })
 
   reg({
-    name: 'cx_note',
+    name: 'eye_list',
     description:
-      '**你自己的笔记本。** 干活中发现规律、或遇到要交给用户的事，就写下来；下次开机 cx_open 会带回来。\n' +
-      '\n' +
-      'tag：\n' +
-      '  lesson   学到的东西（站点规律、工作心得）—— 比如「独立作业页连选项都会被字体混淆」\n' +
-      '  pending  需要用户处理的（听力题、看视频才能做的题、讨论帖、看不懂的模块）\n' +
-      '  skip     主动跳过的（要让用户知道理由）\n' +
-      '  general  其它\n' +
-      '\n' +
-      '用法：\n' +
-      '  { add: "…", tag: "lesson" }   写一条\n' +
-      '  { read: true }               看全部（按 tag 分组）\n' +
-      '  { clear: "pending" }          清空某一类（用户处理完了）\n' +
-      '\n' +
-      '⚠️ 判断「该不该做」是你的事，工具不替你判断；记下来是**你的**结论。',
+      '★ 通用眼睛：这一页**所有能点能填的东西**，每个一个编号（含藏在内嵌窗口里的）。\n'
+      + '不判断哪个该点 —— 那是你的事。找不到东西、认不出页面时，就用它。',
     parameters: {
       type: 'object',
       properties: {
-        add: { type: 'string', description: '要记下的一条' },
-        tag: { type: 'string', enum: ['lesson', 'pending', 'skip', 'general'], description: '分类，默认 general' },
-        read: { type: 'boolean', description: 'true = 读出全部笔记' },
-        clear: { type: 'string', enum: ['lesson', 'pending', 'skip', 'general', 'all'], description: '清空某一类（或 all 清空全部）' },
+        limit: { type: 'number', description: '最多列多少个，默认 70' },
+        frame: { type: 'string', description: '只看某个窗口（窗口名从返回的 byFrame 里取）' },
       },
       additionalProperties: false,
     },
     isConcurrencySafe: () => true,
-    async execute({ add, tag, read, clear } = {}) {
-      if (add) {
-        const r = ST.addNote(tag, add)
-        return { ok: true, ...r, hint: '已记下。**继续干别的，别停下来找用户。**' }
-      }
-      if (clear) {
-        const r = ST.clearNotes(clear === 'all' ? null : clear)
-        return { ok: true, ...r }
-      }
-      // 默认读
-      return { ok: true, ...ST.noteDigest(50), all: ST.loadNotes() }
+    async run({ limit, frame }) {
+      const work = await getWork()
+      return { ok: true, ...(await SEE.readInteractive(work, { limit, frame })) }
     },
   })
 
-  // ═════════════════════════════════════════════════════════════════════════
-  //  cx_verdict —— ★ 判题员专用：把独立判出来的答案登记下来
-  // ═════════════════════════════════════════════════════════════════════════
-  //
-  //  为什么要有它（实测教训 2026-10-08 第三次会话）：
-  //
-  //    那次 6 道测验，把主脑提交的答案和判题员给的答案逐条比对 —— **一字不差**。
-  //    主脑在"转发"，自己根本没做题。所以那一次实质上只有**一份判断**，
-  //    判题员把一道判断题当成多选时，就再也没人兜住 → 20 分。
-  //
-  //    用户的要求是「开两个智能体分开做题，有异议再评审」。
-  //    但光靠提示词要求，主脑完全可以只开一个、或者开了不理会。
-  //
-  //  所以做成机制：
-  //    · 判题员判完，调 cx_verdict 登记（**主脑调会被拒**，闸门反过来）
-  //    · cx_do({action:"answer"}) 会检查：**至少两个不同判题员**登记过
-  //    · 登记结论与主脑要提交的不一致 → **拦下来**，要求先评审
-  //
-  //  这样"三方独立作答"就不是一句请求，而是过不去的关卡。
   reg({
-    name: 'cx_verdict',
+    name: 'eye_shot',
     description:
-      '**判题员专用。** 把你独立判出来的答案登记下来，让主脑能核对。\n' +
-      '（主脑调它会被拒 —— 它该自己读图定答案，不登记。）\n' +
-      'answers 格式和主脑提交时一样：`{"1":["A"],"2":["B","C"]}`，**每一题都要给**。\n' +
-      '拿不准的题号放进 `uncertain`（不要猜）。',
+      '给这一页截图。**图会直接放在返回里 —— 你确实能看到它**，不是只给路径。\n'
+      + '看不清某一处时用 clip 只截那一块（清楚得多）。',
     parameters: {
       type: 'object',
       properties: {
-        answers: { type: 'object', description: '题号 → 选项数组，如 {"1":["A"],"2":["B","C"]}' },
-        uncertain: { type: 'array', items: { type: 'number' }, description: '拿不准的题号' },
-        note: { type: 'string', description: '一句话说明（可选）' },
-      },
-      required: ['answers'],
-      additionalProperties: false,
-    },
-    isConcurrencySafe: () => true,
-    async execute({ answers, uncertain, note } = {}, exec) {
-      const id = exec?.agent?.id ?? '(unknown)'
-      const list = session.verdicts ?? (session.verdicts = [])
-      // 同一个判题员重复登记只保留最新一条（它可能在补一张特写后改口）
-      const prev = list.findIndex((v) => v.agentId === id)
-      const entry = {
-        agentId: id,
-        answers: answers ?? {},
-        uncertain: Array.isArray(uncertain) ? uncertain : [],
-        note: note ?? null,
-        at: Date.now(),
-      }
-      if (prev >= 0) list[prev] = entry
-      else list.push(entry)
-      const judges = new Set(list.map((v) => v.agentId)).size
-      return {
-        ok: true,
-        recorded: true,
-        judgeCount: judges,
-        totalVerdicts: list.length,
-        hint: judges < 2
-          ? `目前只有 ${judges} 个判题员登记。主脑还需要**至少两个独立判题员**才能提交。`
-          : '已登记。主脑会拿你这份和另一份、以及它自己那份比对。',
-      }
-    },
-  })
-
-  reg({
-    name: 'cx_courses',
-    description: '列出账号里的课程及每门课的权威进度（已完成任务点 X/Y）。只读。把清单给用户，由用户决定刷哪门。',
-    parameters: { type: 'object', properties: {}, additionalProperties: false },
-    isConcurrencySafe: () => true,
-    async execute() {
-      const work = await getWork(ctx)
-      if (!(await OBS.isLoggedIn(work))) return { ok: false, error: 'NOT_LOGGED_IN' }
-      await work.goto(OBS.HOME_URL, { timeoutMs: 30_000 })
-      const load = await OBS.waitForCourseListStable(work)
-      const courses = await OBS.readCourseList(work)
-      return {
-        ok: true, listLoad: load,
-        courses: courses.map((c) => ({
-          name: c.name, teacher: c.teacher, courseId: c.courseId, clazzId: c.clazzId,
-          done: c.done, total: c.total, percent: c.percent,
-          // ⚠️ 这行原来写的是 `remaining: c.remaining`，但 readCourseList 根本不返回
-          //    这个字段 → 值是 undefined → DSH 直接拒绝：
-          //    "tool cx_courses returned invalid output: value is not lossless JSON"。
-          //    实测事故里这就是第一块倒下的多米诺骨牌（连课程都列不出来）。
-          remaining: (typeof c.total === 'number' && typeof c.done === 'number')
-            ? Math.max(0, c.total - c.done)
-            : null,
-        })),
-      }
-    },
-  })
-
-  reg({
-    name: 'cx_chapters',
-    description:
-      '列出某门课的章节结构：每个单元、每个小节，以及小节上显示的剩余任务点数（页面徽章）。' +
-      '★ 用它找到「还有没做完的章节」，然后 cx_enter 进去。只读，不改变任何状态。' +
-      '注意：徽章是页面加载时的数，可能滞后；最权威的是进章节后页面头部的「已完成任务点 X/Y」。',
-    parameters: {
-      type: 'object',
-      properties: { course: { type: 'string', description: '课程名（cx_courses 返回的 name）' } },
-      required: ['course'],
-      additionalProperties: false,
-    },
-    isConcurrencySafe: () => true,
-    async execute({ course: courseName } = {}) {
-      const work = await getWork(ctx)
-      if (!(await OBS.isLoggedIn(work))) return { ok: false, error: 'NOT_LOGGED_IN' }
-
-      // ★ 统一入口：resolveCourse 内部先 goto 再等渲染完
-      //   （旧代码是「goto 完立刻读」→ 课程列表还没渲染 → 读到空 → 整条流程断掉）
-      const { all, course } = await resolveCourse(work, courseName)
-      if (!course) {
-        return {
-          ok: false, error: 'COURSE_NOT_FOUND',
-          searched: courseName ?? '(未指定)',
-          availableCount: all.length,
-          available: all.map((c) => c.name).slice(0, 40),
-          hint: all.length
-            ? '课程列表读到了，但没有匹配的名字 —— 从 available 里挑一个准确的。'
-            : '课程列表是空的。可能还没加载完，或者那个页面没登录。先 cx_courses 看看。',
-        }
-      }
-
-      let tree
-      try { tree = await getTree(work, course, { force: true }) }
-      catch (e) { return { ok: false, error: e.code ?? 'CHAPTERS_FAILED', message: e.message } }
-
-      session.course = course
-      return {
-        ok: true,
-        course: { name: course.name, courseId: course.courseId, clazzId: course.clazzId, progress: tree.progress.raw },
-        units: tree.units.map((u, ui) => ({
-          unitIndex: ui + 1, unit: u.unit,
-          sections: u.sections.map((s, si) => ({
-            i: si + 1, title: s.title, chapterId: s.chapterId,
-            badgeRemaining: s.jobCount ?? null,
-          })),
-        })),
-        next: '挑一个还有剩余的小节 → cx_enter({ course, chapterId })。★ 同名小节很多，用 chapterId 最稳。',
-      }
-    },
-  })
-
-  reg({
-    name: 'cx_enter',
-    description:
-      '进入指定课程的某个小节，返回这一小节的页面(tab)列表。\n' +
-      '指定小节有两种方式：\n' +
-      '  · chapterId —— ★ 推荐，精确无歧义（cx_chapters 会给出）\n' +
-      '  · section   —— 标题（模糊匹配）或序号（从 1 开始）\n' +
-      '★ 循环的第一步：决定进哪个小节 → 拿到页面列表 → cx_page({all:true}) 看清全节。\n' +
-      '只进入并读取，不播放、不提交。',
-    parameters: {
-      type: 'object',
-      properties: {
-        course: { type: 'string', description: '课程名（可省略，会用上一次进入的课程）' },
-        section: { type: 'string', description: '小节标题（模糊匹配）或序号' },
-        chapterId: { type: 'string', description: '★ 推荐：小节的 chapterId，精确且不受同名影响' },
-      },
-      additionalProperties: false,
-    },
-    isConcurrencySafe: () => false,
-    async execute({ course: courseName, section: want, chapterId } = {}) {
-      const work = await getWork(ctx)
-      if (!(await OBS.isLoggedIn(work))) return { ok: false, error: 'NOT_LOGGED_IN' }
-
-      // ── 课程：优先用上次的，避免每次重载课程列表页 ───────────────────────
-      let course = session.course
-      if (!course || (courseName && course.name !== courseName)) {
-        // ★ 统一入口。注意这里**不能**用 `goto(HOME_URL)` + 直读的老写法：
-        //   课程列表要等 3.5 秒才渲染出来，直读只会拿到空数组。
-        const { all, course: hit } = await resolveCourse(work, courseName)
-        course = hit ?? null
-        if (!course) {
-          return {
-            ok: false, error: 'COURSE_NOT_FOUND',
-            searched: courseName ?? '(未指定)',
-            availableCount: all.length,
-            available: all.map((c) => c.name).slice(0, 40),
-            hint: all.length
-              ? '课程列表读到了，但没有匹配的名字 —— 从 available 里挑一个准确的。'
-              : '课程列表是空的。可能还没加载完，或者那个页面没登录。先 cx_courses 看看。',
-          }
-        }
-        session.course = course
-      }
-
-      // ── 章节树：缓存 30 分钟 ────────────────────────────────────────────
-      // chapterId ↔ 小节 的对应关系不会变，所以久一点无所谓；
-      // 但进度数字会变，所以返回里标明"这是缓存"。
-      const tree = await getTree(work, course)
-
-      const flat = tree.units.flatMap((u) => u.sections.map((s) => ({ ...s, unit: u.unit })))
-      let section = null
-
-      if (chapterId) {
-        // ★ 直通：用 chapterId 精确定位，不看标题
-        section = flat.find((s) => String(s.chapterId) === String(chapterId))
-        if (!section) {
-          // 缓存里没有（可能是新加的章节）→ 强制重读一次
-          const fresh = await getTree(work, course, { force: true })
-          const flat2 = fresh.units.flatMap((u) => u.sections.map((s) => ({ ...s, unit: u.unit })))
-          section = flat2.find((s) => String(s.chapterId) === String(chapterId))
-          if (!section) {
-            return {
-              ok: false, error: 'SECTION_NOT_FOUND', chapterId,
-              hint: '章节树里没有这个 chapterId。用 cx_chapters 重新看一遍。',
-              sections: flat2.map((s) => ({ title: s.title, chapterId: s.chapterId })),
-            }
-          }
-        }
-      } else if (want != null && want !== '') {
-        const isIndex = /^\d+$/.test(String(want))
-        if (isIndex) {
-          section = flat[Number(want) - 1]
-        } else {
-          const hits = flat.filter((s) => s.title.includes(String(want)) || String(want).includes(s.title))
-          if (hits.length > 1) {
-            // ★ 同名小节：**把歧义摆到台面上**，而不是静默挑第一个
-            //   实测：医学英语 1.1 和 1.2 标题完全一样，静默选中就是错的。
-            return {
-              ok: false, error: 'SECTION_AMBIGUOUS',
-              hint: `有 ${hits.length} 个小节都匹配「${want}」，标题一样，请用 chapterId 指定。`,
-              candidates: hits.map((s) => ({
-                title: s.title, chapterId: s.chapterId, unit: s.unit,
-                badgeRemaining: s.jobCount ?? null, domId: s.domId ?? null,
-              })),
-            }
-          }
-          section = hits[0] ?? null
-        }
-      }
-
-      if (!section) {
-        const list = flat.map((s, i) => ({
-          i: i + 1, unit: s.unit, title: s.title, chapterId: s.chapterId,
-          badgeRemaining: s.jobCount ?? null,
-        }))
-        // ★ 「没指定要进哪个小节」不是错误 —— 章节树已经成功读到了，
-        //   直接把清单给大模型挑就行。旧代码在这里报 SECTION_NOT_FOUND，
-        //   于是大模型以为"读不到章节"，白跑了两步（实测日志第 18 步）。
-        if (want == null || want === '') {
-          return {
-            ok: true, needSection: true,
-            course: course.name, progress: tree.progress?.raw ?? null,
-            sectionCount: list.length,
-            sections: list,
-            hint: '章节树读到了，但你没说要进哪个小节。从上面挑一个，'
-              + '再调 cx_enter({ chapterId }) —— **优先用 chapterId**，标题可能重名。',
-          }
-        }
-        return {
-          ok: false, error: 'SECTION_NOT_FOUND',
-          hint: `没找到「${want}」。下面是小节清单，用 chapterId 精确指定。`,
-          sectionCount: list.length,
-          sections: list,
-        }
-      }
-
-      await work.goto(OBS.chapterListUrl(course), { timeoutMs: 30_000 })
-      await work.waitFor(`document.querySelectorAll('.chapter_item[id]').length > 0`, { timeoutMs: 20_000 })
-      await ACT.enterSection(work, course, section)
-
-      // ★ 先等标签条**渲染出来**再读。
-      //
-      //   实测（2026-10-08 日志）：这一句不写的话，3 次 cx_enter **全部**
-      //   报 NO_TABS_ON_PAGE —— 因为刚导航进小节，`#prev_tab` 还没生成，
-      //   而 readTabs 在没有它的页面上会立刻返回 null（那是为了首页不干等 25 秒）。
-      //   结果模型每次都得再补一次 cx_page({all:true}) 才能干活，白费一步。
-      //
-      //   这里刚导航过，等一下是**对的**；在首页那种没有标签条的地方，
-      //   readTabs 仍然立刻返回 null，不会再干等。
-      await work.waitFor(
-        `!!document.querySelector('#prev_tab li')`,
-        { timeoutMs: 15_000 },
-      ).catch(() => { /* 等不到也照样往下读，让 readTabs 报 NO_TABS_ON_PAGE */ })
-
-      const tabs = await OBS.readTabs(work)
-      // readTabs 在没有 #prev_tab 的页面上会**立刻返回 null**（不再干等 25 秒），
-      // 所以这里必须接住 —— 以前它抛错，现在返回 null，直接 .map 会崩。
-      if (!tabs) {
-        return {
-          ok: false, error: 'NO_TABS_ON_PAGE',
-          url: await work.eval('location.href').catch(() => null),
-          hint: '进了小节，等了 15 秒也没等到标签条 —— 可能这个"小节"不是学习页，'
-            + '或者内容加载失败了。先 cx_page 看 pageKind 是什么，必要时 cx_shot 截图。',
-        }
-      }
-
-      session.course = course
-      session.section = section
-      session.tabs = tabs
-
-      return {
-        ok: true,
-        course: course.name,
-        section: { title: section.title, chapterId: section.chapterId, unit: section.unit },
-        tabs: tabs.map((t, i) => ({ i, title: t.title, cardid: t.cardid })),
-        next: 'cx_tab({ i: 0 }) 翻到第一页并看这一页有什么',
-      }
-    },
-  })
-
-  reg({
-    name: 'cx_page',
-    description:
-      '★ 核心：如实报告**当前这一页**上有哪些任务点、各是什么类型、各自什么状态。\n' +
-      '一个页面(tab)**可以有多个任务点** —— 实测：视频页常常同时挂一个章节测验；' +
-      '听力页同时挂音频 + 听力练习。所以不要假设一页只有一个任务点。\n' +
-      '返回 items 列表，每项有 key（跨页唯一，如 "2:1"）和 t（本页内编号）。\n' +
-      '**默认不带参数：只报当前这一页（快）。**\n' +
-      '`all: true`：走遍这一节的**所有页面**，一次报告整节 —— 4 个页面就是 1 次调用而不是 4 次。\n' +
-      '★ 建议：每进一个新小节，先 `cx_page({all:true})` 看清全貌，再决定先做哪个。',
-    parameters: {
-      type: 'object',
-      properties: {
-        all: {
-          type: 'boolean',
-          description: 'true = 报告整节所有页面（每个页面各翻一次，几秒）；默认 false = 只报当前页',
-        },
-      },
-      additionalProperties: false,
-    },
-    isConcurrencySafe: () => true,
-    async execute({ all = false } = {}) {
-      const work = await getWork(ctx)
-      const tabs = await OBS.readTabs(work).catch(() => session.tabs ?? null)
-      if (all) {
-        if (!tabs) {
-          // 不在小节页上就别报一句干巴巴的 NO_TABS —— 先告诉它人在哪
-          const info = await OBS.detectPageKind(work).catch(() => null)
-          return {
-            ok: false, error: 'NO_TABS_ON_PAGE',
-            pageKind: info?.kind ?? 'UNKNOWN',
-            pageHint: info?.why ?? null,
-            url: info?.href ?? null,
-            hint: info?.kind === 'SECTION'
-              ? '这确实是小节页，但标签条没读到。先 cx_page()（不带 all）看单页情况，必要时 cx_shot 截图。'
-              : '你现在不在小节学习页上，所以没有"整节"可看。'
-                + '先 cx_chapters 找到还有剩余任务点的小节，再用 cx_enter({ chapterId }) 进去。',
-          }
-        }
-        return { ok: true, ...(await inventoryAll(work, { tabs })) }
-      }
-      return { ok: true, ...(await inventory(work, { tabs })) }
-    },
-  })
-
-  reg({
-    name: 'cx_shot',
-    description: '给当前页面截图。**图会直接放在返回里 —— 你确实能看到它**，不是只给路径。' +
-      '同时落一份文件到当前工作区的 .chaoxing/shots/。\n' +
-      '⚠️ 学习通按页面类型做反扒混淆（独立作业页连**选项**都会乱码），所以 DOM 里的中文一律不可信 —— ' +
-      '**要读懂题目文字（题干和选项）必须看图**。看不清就用 clip 只截那一块，清晰得多。',
-    parameters: {
-      type: 'object',
-      properties: {
-        full: { type: 'boolean', description: '是否整页截图，默认 false（可视区）' },
-        label: { type: 'string', description: '文件名标签' },
+        full: { type: 'boolean', description: '整页截图（默认只截当前这一屏）' },
         clip: {
           type: 'object',
-          description: '★ 只截一块 —— 用于"题目看不清"：子智能体反馈某题看不清时，' +
-            '用 cx_dom 或截图量出那道题的坐标，只截那块，清晰度会高很多。' +
-            '形如 {"x":100,"y":600,"width":900,"height":300}（CSS 像素）',
-          properties: {
-            x: { type: 'number' }, y: { type: 'number' },
-            width: { type: 'number' }, height: { type: 'number' },
-          },
+          description: '只截一块：{x,y,width,height}（当前屏幕坐标）',
+          properties: { x: { type: 'number' }, y: { type: 'number' }, width: { type: 'number' }, height: { type: 'number' } },
+          additionalProperties: false,
+        },
+        label: { type: 'string', description: '文件名标记，方便你认' },
+        useShotId: { type: 'string', description: '如果这次坐标是从某张旧截图上读的，把那张图的 shotId 带上' },
+      },
+      additionalProperties: false,
+    },
+    isConcurrencySafe: () => true,
+    async run({ full, clip, label, useShotId }) {
+      if (useShotId) {
+        const s = B.getShot?.(useShotId)
+        if (!s) {
+          return {
+            ok: false, category: 'ARG',
+            error: `找不到 shotId "${useShotId}" 对应的那张截图（可能太旧，已经清掉了）`,
+            expected: 'useShotId 只能填最近 20 张截图里的 shotId；不想引用旧图就把它省掉',
+            example: 'eye_shot({"clip":{"x":100,"y":200,"width":600,"height":300}})',
+          }
+        }
+      }
+      const work = await getWork()
+      const r = await takeShot(ctx, work, { full, label, clip })
+      const url = await work.eval('location.href').catch(() => null)
+      const frameRects = await work.frameRects?.().catch?.(() => []) ?? []
+      const scrollY = await work.eval('window.scrollY').catch(() => null)
+      const shotId = B.rememberShot?.({ targetId: work.targetId, url, scrollY, frameRects, at: Date.now() }) ?? null
+
+      const out = {
+        ok: true,
+        file: r.file, bytes: r.bytes, type: r.type,
+        imageAttached: Boolean(r.image),
+        shotId,
+        frameRects,
+        url,
+      }
+      if (r.downscaled) out.note = r.note
+      if (!r.image) {
+        out.hint = '图没能作为图片送回来（imageAttached:false）。用 read_image 读 file 那个路径；再不行就手记下来交给用户。'
+      }
+      if (r.image) out.__images = [r.image]
+      return out
+    },
+  })
+
+  reg({
+    name: 'eye_check',
+    description:
+      '★ 交之前的复核（**只读，跑多少次都不影响页面**）。\n'
+      + '走查七条：挑的有没有空着 / 选了页面上没有的项 / 写的是不是空的 / '
+      + '复核员够不够两份 / 三份一不一致 / 还有没有拿不准的 / 你指定的"交"按钮在不在。\n'
+      + '★ 全部通过才给**票据**（token）；没有票据就交不出去。不一致时**永远不给票据**。',
+    parameters: {
+      type: 'object',
+      properties: {
+        ignore: {
+          type: 'array', items: { type: 'number' },
+          description: '哪几处不是要答的题（比如一个无关的勾选框），不用复核。填对账清单的编号 n。',
+        },
+        submitButton: {
+          type: 'object',
+          description: '"交"那个按钮的定位 —— 给上它，复核会顺便确认它真的在页面上',
         },
       },
       additionalProperties: false,
     },
     isConcurrencySafe: () => true,
-    async execute({ full = false, label = 'shot', clip = null } = {}) {
-      const work = await getWork(ctx)
-      const shot = await takeShot(ctx, work, { full, label, clip })
-      const { image, ...rest } = shot
-      return {
-        ok: true, ...rest,
-        // ★ 这里返回的图会**真的显示给你看**（不是路径）。看图，别读 DOM。
-        imageAttached: !!image,
-        ...(image ? { __images: [image] } : {}),
-        ...(image ? {} : { warn: '图没能附上（附件服务不可用），只能用 file 路径。' }),
-        url: await work.eval('location.href').catch(() => null),
-      }
-    },
-  })
+    async run({ ignore, submitButton }) {
+      const work = await getWork()
+      const r = await SEE.readAreas(work, { full: false })
+      const areas = r.areas ?? []
+      const ledger = GATE.buildLedger(areas, ignore)
+      const lh = GATE.ledgerHash(ledger)
+      const fingerprint = GATE.pageFingerprint({ targetId: work.targetId, url: r.url, areas })
 
-  reg({
-    name: 'cx_progress',
-    description:
-      '读取本地进度和你的笔记（pending / skip 两类）。\n' +
-      '★ 一轮刷完（或用户要求做完）后调它，把 pending / skip **一次性**汇报给用户 —— ' +
-      '不要一遇到就打断用户。\n' +
-      '用户确认看过之后，用 cx_note({ clear: "pending" }) 清空。',
-    parameters: { type: 'object', properties: {}, additionalProperties: false },
-    isConcurrencySafe: () => true,
-    async execute() {
-      const state = ST.loadState()
-      const sum = ST.summary(state)
-      const notes = ST.loadNotes()
-      const pending = notes.filter((x) => x.tag === 'pending')
-      const skipped = notes.filter((x) => x.tag === 'skip')
+      const store = session.verdicts[lh] ?? {}
+      const entries = Object.entries(store).map(([id, v]) => ({ id, ...v }))
+
+      let submitFound = true
+      if (submitButton) {
+        const hit = await SEE.findElementByLocator(work, submitButton).catch(() => ({ found: false }))
+        submitFound = Boolean(hit?.found && hit.visible !== false)
+      }
+
+      const gate = GATE.checkGate({ areas, ledger, entries, ignore, submitButton, submitFound })
+      const token = GATE.makeToken({ fingerprint, ledgerHash: lh, gate })
+      if (token) session.lastToken = { token, fingerprint, ledgerHash: lh, at: Date.now() }
+
       return {
-        ok: true, ...sum,
-        notesTotal: notes.length,
-        pendingCount: pending.length,
-        skippedCount: skipped.length,
-        pending,
-        skipped,
-        reportText: pending.length || skipped.length
-          ? [
-              pending.length ? `需要你处理（${pending.length} 条）：\n${pending.map((x) => '  · ' + x.text).join('\n')}` : '',
-              skipped.length ? `主动跳过（${skipped.length} 条）：\n${skipped.map((x) => '  · ' + x.text).join('\n')}` : '',
-            ].filter(Boolean).join('\n\n')
-          : '没有需要你处理的条目。',
+        ok: true,
+        verdict: gate.verdict,
+        canSubmit: gate.pass,
+        token,
+        ledger,
+        areas: {
+          total: areas.length,
+          pick: areas.filter((a) => a.kind === 'pick').length,
+          write: areas.filter((a) => a.kind === 'write').length,
+        },
+        judges: gate.judges,
+        problems: gate.problems.map((p) => p.text),
+        // ★ 这一页现在有哪些"能点的东西"，**带刚刚重新读到的编号**。
+        //   为什么要给：编号只在"最近一次看"有效（eye_see / eye_check / hand_verdict 都会重新编号）。
+        //   交之前复核员登记过一轮，页面早被重新读过 —— 拿旧的编号去点会报 ELEMENT_NOT_FOUND。
+        //   用这里给的按钮编号去 hand_submit，就一定是最新的。
+        buttons: areas.filter((a) => a.kind === 'button').map((a) => ({ i: a.i, label: a.label })),
+        hint: gate.pass
+          ? '复核通过。把它交给 hand_submit({ confirm:true, reviewed:"票据", button:… }) 就能交 —— '
+            + '**button 用上面 buttons 里的编号**（那是刚刚重新读到的，旧的已经作废）。'
+          : '**还不交。** 上面那几条不是拒绝你，是叫你回去把那几处定下来。\n'
+            + '实在定不下来就 hand_note({ tag:"pending" }) 记给用户 —— 宁可交人，不要猜。',
       }
     },
   })
 
   // ═════════════════════════════════════════════════════════════════════════
-  //  做
+  //  手（6）—— 只做一个动作
   // ═════════════════════════════════════════════════════════════════════════
 
   reg({
-    name: 'cx_tab',
+    name: 'hand_click',
     description:
-      '翻到当前小节的某个页面(tab)。i 是 cx_enter 返回的序号（从 0 开始），也可以直接给 cardid。' +
-      '翻页后会等这一页真正就绪，并直接返回这一页的任务点清单（等于自动调一次 cx_page）。' +
-      '切换失败会明确报错 —— 绝不拿上一页的数据冒充这一页。',
+      '点一下。定位三种写法任选一种：编号 {i} / 可见文字 {text,frame,exact} / 当前屏幕坐标 {x,y}。\n'
+      + '★ 返回里会告诉你**页面怎么变了**（urlBefore/urlAfter/navigated）—— 这是你认识世界的主要反馈。',
     parameters: {
       type: 'object',
       properties: {
-        i: { type: 'number', description: 'tab 序号，从 0 开始' },
-        cardid: { type: 'string', description: '也可以直接给 cardid' },
-      },
-      additionalProperties: false,
-    },
-    isConcurrencySafe: () => false,
-    async execute({ i, cardid } = {}) {
-      const work = await getWork(ctx)
-      const tabs = await OBS.readTabs(work)
-      if (!tabs) {
-        return {
-          ok: false, error: 'NO_TABS_ON_PAGE',
-          url: await work.eval('location.href').catch(() => null),
-          hint: '当前页面上没有标签条 —— 你可能不在小节学习页上。'
-            + '先 cx_page 看 pageKind；不在 SECTION 就先 cx_enter 进一个小节。',
-        }
-      }
-      const tab = cardid ? tabs.find((t) => t.cardid === cardid) : tabs[Number(i)]
-      if (!tab) {
-        return {
-          ok: false, error: 'TAB_NOT_FOUND', got: { i, cardid },
-          tabs: tabs.map((t, k) => ({ i: k, title: t.title, cardid: t.cardid })),
-        }
-      }
-
-      const sw = await ACT.switchTab(work, tab, { timeoutMs: 40_000 })
-      if (sw.switched === false) return { ok: false, error: 'TAB_SWITCH_FAILED', detail: sw.reason }
-      if (sw.ok === false) {
-        return {
-          ok: false, error: sw.blockedBy ? `BLOCKED_${sw.blockedBy}` : 'MODULE_NOT_LOADED',
-          detail: sw.reason, blockedBy: sw.blockedBy ?? null, tab: tab.title,
-        }
-      }
-      session.tabs = tabs
-      return { ok: true, switched: true, ...(await inventory(work, { tabs, tabIndex: tabs.indexOf(tab) })) }
-    },
-  })
-
-  reg({
-    name: 'cx_nav',
-    description:
-      '翻小节：点小节页底部的「下一节」或「上一节」。dir 取 "next"（默认）或 "prev"。' +
-      '★ 一个小节做完了就用它往后走，不用重读整棵章节树。' +
-      '只做翻页动作 + 返回新小节的页面(tab)列表，不做任何判断。',
-    parameters: {
-      type: 'object',
-      properties: { dir: { type: 'string', enum: ['next', 'prev'], description: '默认 next' } },
-      additionalProperties: false,
-    },
-    isConcurrencySafe: () => false,
-    async execute({ dir = 'next' } = {}) {
-      const work = await getWork(ctx)
-      if (!(await OBS.isLoggedIn(work))) return { ok: false, error: 'NOT_LOGGED_IN' }
-      const r = await ACT.navSection(work, { dir })
-      if (!r.ok) {
-        return { ok: false, error: 'NAV_FAILED', detail: r.why,
-          hint: '当前页面可能没有「上一节/下一节」按钮。确认你停在小节学习页，或改用 cx_enter 指定小节。' }
-      }
-      session.tabs = r.tabs ?? null
-      return {
-        ok: true, moved: dir, label: r.label, url: r.url,
-        tabs: (r.tabs ?? []).map((t, i) => ({ i, title: t.title, cardid: t.cardid })),
-        next: '用 cx_tab({ i: 0 }) 看新小节的第一页有什么',
-      }
-    },
-  })
-
-  // ═════════════════════════════════════════════════════════════════════════
-  //  通用手眼 —— 不与任何任务绑定
-  //
-  //  高层工具（cx_do 的 play/read/answer）只覆盖了**已知**的任务点类型。
-  //  但学习通里有很多任务点只是**极普通的交互**：
-  //     点进一个文件 → 一直往下翻 → 退出
-  //     点开一个链接 → 等加载 → 返回
-  //  这些既写不进脚本（类型无穷），也写不进提示词（写不全）。
-  //
-  //  所以给大模型**通用的眼睛和手**：自己看、自己点、自己判断。
-  //  ⚠️ 这四个工具**不含任何任务知识** —— 不判断该不该点、点了会怎样。
-  // ═════════════════════════════════════════════════════════════════════════
-
-  reg({
-    name: 'cx_dom',
-    description:
-      '★ 通用眼睛：列出**当前页面所有可以点的东西**（链接 / 按钮 / 输入框，含子窗口里的），' +
-      '每个给一个编号 i。\n' +
-      '用在什么时候：遇到你不认识的模块（pdf / 专题 / 外链…），' +
-      '或者任何你想"看看这页有什么可点的"的时候。\n' +
-      '拿到编号后用 cx_click({ i }) 点它。看不见文字的图标按钮配合 cx_shot 截图判断。\n' +
-      '只在按编号点击时有效 —— 页面一变（翻页/跳转），编号就失效，要重新 cx_dom。',
-    parameters: {
-      type: 'object',
-      properties: { limit: { type: 'number', description: '最多列多少个，默认 70' } },
-      additionalProperties: false,
-    },
-    isConcurrencySafe: () => true,
-    async execute({ limit = 70 } = {}) {
-      const work = await getWork(ctx)
-      return { ok: true, ...(await OBS.readInteractive(work, { limit })) }
-    },
-  })
-
-  reg({
-    name: 'cx_click',
-    description:
-      '★ 通用手：点击。三种方式，任选一种：\n' +
-      '  i        —— cx_dom 给出的编号（**推荐**，精确）\n' +
-      '  text     —— 按可见文字点（找到多个会报 TEXT_AMBIGUOUS，不猜）\n' +
-      '  x, y     —— 按坐标点（用于截图里看到、但 DOM 抓不到的图标按钮）\n' +
-      '会如实回报**实际点了什么元素**（标签/文字/链接），点完返回新地址和当前所有子窗口。',
-    parameters: {
-      type: 'object',
-      properties: {
-        i: { type: 'number', description: 'cx_dom 给出的编号' },
-        text: { type: 'string', description: '按可见文字点击' },
-        exact: { type: 'boolean', description: 'text 是否要求完全相等，默认包含' },
-        x: { type: 'number', description: '坐标点击的 X' },
-        y: { type: 'number', description: '坐标点击的 Y' },
+        i: { type: 'string', description: 'eye_see / eye_list 返回的编号（最稳）' },
+        text: { type: 'string', description: '屏幕上看得见的文字' },
+        exact: { type: 'boolean', description: 'text 是否要求完全相等（默认包含）' },
+        frame: { type: 'string', description: '文字在哪个窗口（多窗口同名时必须给）' },
+        x: { type: 'number', description: '当前屏幕坐标 X' },
+        y: { type: 'number', description: '当前屏幕坐标 Y' },
         settleMs: { type: 'number', description: '点完等多久再回报，默认 1500ms' },
       },
       additionalProperties: false,
     },
     isConcurrencySafe: () => false,
-    execute: serial(async ({ i, text, x, y, exact = false, settleMs = 1500 } = {}) => {
-      const work = await getWork(ctx)
-      if (i != null) return await ACT.clickIndex(work, i, { settleMs })
-      if (text) return await ACT.clickText(work, text, { exact, settleMs })
-      if (x != null && y != null) return await ACT.clickPoint(work, x, y, { settleMs })
-      return {
-        ok: false, error: 'NEED_TARGET',
-        hint: '要给 i（cx_dom 的编号）、text、或 x+y 之一。不知道点哪个就先 cx_dom 看看。',
+    serial: true,
+    async run({ loc, settleMs }) {
+      const work = await getWork()
+      const r = await HAND.clickLocator(work, loc, { settleMs })
+      // ★ 软保护：点到一个"一看就是提交"的按钮、却还没复核过 → 拦住，叫它走 hand_submit
+      const label = String(r?.clicked?.text ?? '')
+      if (/提交|交卷|上交|确认提交|submit/i.test(label) && !session.lastToken) {
+        return {
+          ok: false, category: 'USAGE', error: 'SUBMIT_MUST_GO_THROUGH_HAND_SUBMIT',
+          expected: '交答案只能用 hand_submit —— 它会先复核（空着的、越界的、复核员够不够、三份一不一致），过了才点。',
+          example: '先 eye_check({}) 拿票据，再 hand_submit({ confirm:true, reviewed:"票据", button:{i:"…"} })',
+          hint: '你点到的是「' + label.slice(0, 40) + '」。交是全站唯一做错回不了头的动作，不能顺手点过去。',
+        }
       }
-    }),
+      return { ok: true, ...r }
+    },
   })
 
   reg({
-    name: 'cx_scroll',
+    name: 'hand_pick',
     description:
-      '★ 通用手：翻页 / 滚动。to 取 "down"（默认，往下翻一段）/ "bottom"（到底）/ "up" / "top"。\n' +
-      'times 可以一次连翻多下。\n' +
-      '会自己找页面上**最大的那个可滚动容器**（pdf / 专题阅读器常常是自绘的，窗口本身不滚）。\n' +
-      '返回 atBottom 告诉你到底了没有 —— 没到底可以再翻。',
+      '★ 在某个「可挑区」里挑选项。单选、多选、判断、下拉 —— **对它来说都是同一件事**。\n'
+      + '只认识页面上**真实存在**的选项：给了一个页面上没有的，它会报 rejected 并告诉你实际有哪几个，**绝不瞎点**。',
     parameters: {
       type: 'object',
       properties: {
-        to: { type: 'string', enum: ['down', 'bottom', 'up', 'top'], description: '默认 down' },
+        area: { type: 'object', description: '哪一处（eye_see 返回的 area，填它的编号或文字）' },
+        choose: { type: 'array', description: '要挑哪几个选项（每个都是一个定位）' },
+        mode: { type: 'string', enum: ['set', 'add', 'clear'], description: 'set 覆盖（默认）/ add 追加 / clear 全取消' },
+      },
+      required: ['area'],
+      additionalProperties: false,
+    },
+    isConcurrencySafe: () => false,
+    serial: true,
+    async run({ area, choose, mode }) {
+      const work = await getWork()
+      const r = await HAND.pickOptions(work, { area, choose, mode })
+      return { ok: true, ...r, changed: `这一处现在选中 ${r?.areaState?.selected ?? '?'} / 共 ${r?.areaState?.total ?? '?'} 个选项` }
+    },
+  })
+
+  reg({
+    name: 'hand_write',
+    description:
+      '★ 在你指定的那块「可写区」里写文字。写完会**回读**一次，报告实际写进去的内容（不是"我应该写上了"）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        area: { type: 'object', description: '写到哪一处（eye_see 返回的 area 的编号或文字）' },
+        text: { type: 'string', description: '写什么' },
+        mode: { type: 'string', enum: ['replace', 'append'], description: 'replace 覆盖（默认）/ append 接着写' },
+      },
+      required: ['area', 'text'],
+      additionalProperties: false,
+    },
+    isConcurrencySafe: () => false,
+    serial: true,
+    async run({ area, text, mode }) {
+      const work = await getWork()
+      const r = await HAND.writeInto(work, { area, text, mode })
+      return { ok: true, ...r, changed: `这一处现在的内容是：${String(r?.valueNow ?? '').slice(0, 120)}` }
+    },
+  })
+
+  reg({
+    name: 'hand_scroll',
+    description: '滚动页面。翻长文档、找下面的东西时用。',
+    parameters: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', enum: ['down', 'up', 'bottom', 'top'], description: '默认 down' },
         px: { type: 'number', description: '每次滚多少像素，默认 800' },
         times: { type: 'number', description: '重复几次，默认 1' },
       },
       additionalProperties: false,
     },
     isConcurrencySafe: () => false,
-    execute: serial(async ({ to = 'down', px = 800, times = 1 } = {}) => {
-      const work = await getWork(ctx)
-      return await ACT.scrollPage(work, { to, px, times })
-    }),
+    serial: true,
+    async run({ to, px, times }) {
+      const work = await getWork()
+      const r = await HAND.scrollPage(work, { to, px, times })
+      return { ok: true, ...r, changed: `滚到了 ${r?.viewportY ?? '?'} / 共 ${r?.maxY ?? '?'}` }
+    },
   })
 
   reg({
-    name: 'cx_type',
+    name: 'hand_goto',
     description:
-      '★ 通用手：往输入框里写字。i 是 cx_dom 给出的编号（必须是 input / textarea）。\n' +
-      '会触发 input / change 事件，所以站点自己的校验也认得。' +
-      '章节测验的填空**不要用这个** —— 用 cx_do({ key, action:"answer", answers }) 才有提交与校验。',
+      '★ **唯一的导航工具**。跳网址 / 后退 / 刷新，三选一。\n'
+      + '工具**不会自作主张跳页** —— 要跳，你自己明确说出来。',
     parameters: {
       type: 'object',
       properties: {
-        i: { type: 'number', description: 'cx_dom 给出的编号' },
-        text: { type: 'string', description: '要写进去的文字' },
-        enter: { type: 'boolean', description: '写完后在该位置点一下，默认 false' },
+        url: { type: 'string', description: '要去的网址（http/https）' },
+        back: { type: 'boolean', description: 'true = 后退' },
+        reload: { type: 'boolean', description: 'true = 刷新' },
       },
-      required: ['i', 'text'],
       additionalProperties: false,
     },
     isConcurrencySafe: () => false,
-    execute: serial(async ({ i, text, enter = false } = {}) => {
-      const work = await getWork(ctx)
-      return await ACT.typeInto(work, i, text, { enter })
-    }),
+    serial: true,
+    async run({ url, back, reload }) {
+      const work = await getWork()
+      const before = await work.eval('location.href').catch(() => null)
+      let r
+      if (url) r = await HAND.gotoUrl(work, url)
+      else if (back) r = await HAND.goBack(work)
+      else r = await HAND.reloadPage(work)
+      return { ok: true, urlBefore: before, ...r, changed: `从 ${before ?? '?'} 到了 ${r?.url ?? '?'}` }
+    },
   })
 
   reg({
-    name: 'cx_do',
+    name: 'hand_tab',
     description:
-      '对某一个任务点执行**一个**明确动作。\n' +
-      '目标用 **key**（推荐，跨页唯一，如 "2:1"）或 t（本页内编号）。\n' +
-      '给 key 时会**自动切到那个页面**再动手 —— 不必先 cx_tab。\n' +
-      '\n' +
-      'action：\n' +
-      '  play   播放该视频/音频到完成（原速、不拖拽、不伪造心跳）。' +
-      '播完会**回读页面自己的记账**，返回 verified 告诉你任务点是不是真的翻成了已完成。\n' +
-      '  read   等测验加载完，返回题目结构，**并附上截图路径**（DOM 文字可能全是乱码，看图）。\n' +
-      '  answer 给测验作答并提交。answers = {"1":["A"],"2":["B","C"]}。\n' +
-      '         ★ **必须覆盖每一题**：工具会先数这套题有几道，缺任何一题就退回不提交\n' +
-      '           （实测教训：5 道题只给了 4 个答案 → 40 分）。\n' +
-      '         提交前还会校对「浏览器里真的选中了这些」，不一致也拒绝。\n' +
-      '\n' +
-      '⚠️ 这里只有三个动作。**「要不要做」「做不到该怎么办」这类判断不在工具里 —— 归你。**\n' +
-      '   遇到你判断不该做/做不到的（听力题、看视频题、讨论帖、看不懂的模块），\n' +
-      '   用 cx_note({ add, tag:"pending" }) 记下来，继续干别的，最后统一汇报。\n' +
-      '   主动跳过的用 tag:"skip"。\n' +
-      '做完会重新清点这一页并返回最新状态。',
+      '换浏览器标签页（不是网页里的页签，是浏览器顶上那一排）。\n'
+      + '给 i（序号，从 0 开始，见 eye_open 返回的 tabs）或 id。换完之后的工具都作用在新标签页上。',
     parameters: {
       type: 'object',
       properties: {
-        key: { type: 'string', description: '★ 推荐。cx_page 返回的 key，格式 "页面序号:本页编号"，如 "2:1"' },
-        t: { type: 'number', description: '本页内编号（只在当前页有效；给了 key 就忽略它）' },
-        action: { type: 'string', enum: ['play', 'read', 'answer'] },
-        answers: { type: 'object', description: 'action=answer 时：题号 → 选项数组，如 {"1":["A","B"]}' },
-        maxMinutes: { type: 'number', description: 'action=play 的时长上限，默认 12 分钟' },
-        afterReview: {
-          type: 'boolean',
-          description: 'action=answer 时：判题员和你不一致、你已经评审过（补了特写、重新比对）才传 true。'
-            + '不传就会被 JUDGES_DISAGREE 拦下。',
-        },
+        i: { type: 'number', description: '标签页序号，从 0 开始' },
+        id: { type: 'string', description: '标签页 id（eye_open 返回的 tabs 里的 id）' },
       },
-      required: ['action'],
       additionalProperties: false,
     },
     isConcurrencySafe: () => false,
-    execute: serial(async ({ key, t, action, answers, maxMinutes, afterReview = false } = {}) => {
-      const work = await getWork(ctx)
-      if (!(await OBS.isLoggedIn(work))) return { ok: false, error: 'NOT_LOGGED_IN' }
-
-      let tabs = await OBS.readTabs(work).catch(() => null)
-
-      // ★ 给了 key → 先切到它所在的那个页面
-      //    key 的格式是 "<页面序号>:<本页内编号>"，由 cx_page 生成（跨页唯一）
-      let wantT = t
-      let switched = null
-      if (typeof key === 'string' && key.includes(':')) {
-        const [pageIdxRaw, itemRaw] = key.split(':')
-        wantT = Number(itemRaw)
-        const pageIdx = Number(pageIdxRaw)
-        if (Number.isInteger(pageIdx) && tabs?.[pageIdx]) {
-          const cur = await getActiveTabIndex()
-          if (cur !== pageIdx) {
-            const sw = await ACT.switchTab(work, tabs[pageIdx], { timeoutMs: 40_000 })
-            if (sw.ok === false || sw.switched === false) {
-              return {
-                ok: false, error: sw.blockedBy ? `BLOCKED_${sw.blockedBy}` : 'TAB_SWITCH_FAILED',
-                key, detail: sw.reason ?? null,
-                hint: '没能切到那个页面，没做任何动作。可先 cx_tab 手动切过去看看。',
-              }
-            }
-            switched = tabs[pageIdx].title
-          }
-          tabs = await OBS.readTabs(work).catch(() => tabs)
-        }
-      }
-
-      async function getActiveTabIndex() {
-        const a = await OBS.readActiveTab(work).catch(() => null)
-        return a && tabs ? tabs.findIndex((x) => x.cardid === a.cardid) : -1
-      }
-
-      const before = await inventory(work, { tabs })
-      const item = before.items.find((x) => x.t === Number(wantT))
-      if (!item) {
+    serial: true,
+    async run({ i, id }) {
+      if (!session.browser) await getWork()
+      const tabs = await tabsOf(session.browser)
+      let want = null
+      if (id) want = tabs.find((t) => t.id === id) ?? null
+      else want = tabs[i] ?? null
+      if (!want || !want.id) {
         return {
-          ok: false, error: 'ITEM_NOT_FOUND', key: key ?? null, t: wantT ?? null,
-          available: before.items.map((x) => ({ key: x.key, t: x.t, kind: x.kind, action: x.action })),
-          hint: '先调 cx_page（或 cx_page({all:true})）看这一页/这一节有哪些任务点。',
+          ok: false, category: 'WORLD', error: 'TAB_NOT_FOUND',
+          tabs: tabs.map((t) => ({ i: t.i, id: t.id, url: t.url.slice(0, 120), blank: t.blank })),
+          hint: '没有这个标签页。从上面 tabs 里挑一个真实的 i 或 id。',
         }
       }
-
-      const state = ST.loadState()
-      const cardid = before.cardId
-      const course = session.course
-      const record = (extra) => (course && cardid
-        ? ST.markCompleted(state, course, cardid, { title: `${before.tab} / ${item.title ?? item.kind}`, type: item.kind, ...extra })
-        : null)
-
-      let result
-      switch (action) {
-        // ── 播放：纯执行 ──────────────────────────────────────────────────
-        case 'play': {
-          if (item.kind !== 'video' && item.kind !== 'audio') {
-            return { ok: false, error: 'NOT_PLAYABLE', kind: item.kind, hint: '该 item 不是播放器' }
-          }
-          const r = await ACT.watchTaskPoint(work, { maxMs: (maxMinutes ?? 12) * 60_000, cardid })
-          result = {
-            ok: r.status === 'COMPLETED',
-            status: r.status,
-            detail: r.detail ?? r.reason ?? null,
-            progressRatio: r.progressRatio ?? null,
-            anomalies: r.anomalies ?? null,
-            // ★ 关键：播放完成 ≠ 任务点完成
-            verified: r.verified,
-            taskPointAfter: r.taskPointAfter,
-            verifyNote: r.verifyNote,
-          }
-          if (r.status === 'COMPLETED' && r.verified === true) record({ note: '播放完成且页面已记账' })
-          break
-        }
-
-        // ── 读题：只读 ────────────────────────────────────────────────────
-        case 'read': {
-          if (item.kind !== 'quiz') return { ok: false, error: 'NOT_A_QUIZ', kind: item.kind }
-          // ★ 新一轮判题：清空上一题的判题员登记。
-          //   这样 answer 检查的必然是"这一张图"的独立结论，不会拿上一题的凑数。
-          session.verdicts = []
-          const q = await OBS.waitForQuizLoaded(work, { timeoutMs: 40_000 })
-          // ★ 顺手截图：因为题干和选项的 DOM 文字**可能全是乱码**，
-          //   "读题"这个动作天然就需要那张图。合并成一步，Agent 少一次调用、也不会忘。
-          //   图会**真的附在返回里**（见 objOut.render），不是只给路径。
-          const shot = await takeShot(ctx, work, { full: true, label: `quiz-${item.key ?? item.t}` })
-            .catch(() => null)
-          const { image, ...shotRest } = shot ?? {}
-          result = {
-            ok: !!q.found, quiz: q, shot: shotRest,
-            imageAttached: !!image,
-            ...(image ? { __images: [image] } : {}),
-            note: q.obfuscatedStem
-              ? '这一页 DOM 文字被字体混淆 —— **以你看到的图为准**，DOM 只用来数题型/选项个数。'
-              : null,
-          }
-          break
-        }
-
-        // ── 作答：执行 + 校验 + 提交 ───────────────────────────────────────
-        case 'answer': {
-          if (item.kind !== 'quiz') return { ok: false, error: 'NOT_A_QUIZ', kind: item.kind }
-          if (item.submitted) { result = { ok: true, status: 'ALREADY_GRADED', score: item.score }; break }
-
-          await OBS.waitForQuizLoaded(work, { timeoutMs: 40_000 })
-          const before = await OBS.readQuizContent(work)
-
-          // ★★ 覆盖检查：**每一题都必须有答案**。
-          //
-          //   实测（2026-10-08）：一次「题量 5」的测验，模型只给了 4 个答案
-          //   （漏了判断题第 5 题），直接提交 → 40/100。
-          //   这是**机械可查**的疏忽，不该让它过去。
-          //
-          //   逻辑抽在 lib/check.mjs 里 —— 那是纯函数，有单元测试兜着。
-          const total = before.questionCount ?? before.questions?.length ?? 0
-          const ansKeys = answers ?? {}
-          const cov = CHK.checkAnswerCoverage(total, ansKeys)
-          if (!cov.ok) {
-            return {
-              ok: false,
-              error: 'ANSWERS_INCOMPLETE',
-              total: cov.total,
-              missing: cov.missing,
-              empty: cov.empty,
-              extra: cov.extra,
-              whichQuestions: cov.detail,
-              hint: CHK.describeAnswerGap(cov),
-            }
-          }
-
-          // ★★ 形状检查：答案和题目的「形状」对得上吗 —— 在**点击之前**就拦。
-          //
-          //   实测（2026-10-08 第三次会话）：第 3 题是**判断题**，
-          //   DOM 上只有 A(对) / B(错) 两个选项，模型却给了 ["A","B","C"]。
-          //   下面那个事后守卫确实拦住了提交（这点它做对了），
-          //   但只说了句「请检查题号和选项」—— 模型没看懂，
-          //   改成 ["A"] 重交 → 20 分。
-          //
-          //   所以提前拦，并且把话说清楚：哪一题、几个选项、实际是哪几个字母。
-          const shape = CHK.checkAnswerShape(before.questions ?? [], ansKeys)
-          if (!shape.ok) {
-            return {
-              ok: false,
-              error: 'ANSWERS_SHAPE_MISMATCH',
-              problems: shape.problems,
-              questionsShape: (before.questions ?? []).map((q, i) => ({
-                q: i + 1, kind: q.kind ?? null,
-                optionCount: q.options?.length ?? null,
-                letters: (q.options ?? []).map((o) => o.letter).filter(Boolean),
-              })),
-              hint: CHK.describeShapeProblems(shape),
-            }
-          }
-
-          // ★★ 独立判题员闸门：**至少两个不同判题员**登记过结论才允许提交。
-          //
-          //   实测教训：上一次 6 道测验，主脑提交的答案和判题员给的**一字不差** ——
-          //   它在转发，实质上只有一份判断，判题员错了就没人兜住 → 20 分。
-          //   用户要求"开两个智能体分开做题"，光靠提示词要求不住，所以做成关卡。
-          const verdicts = session.verdicts ?? []
-          const cmp = CHK.compareJudgeAnswers(ansKeys, verdicts)
-          if (!cmp.enough) {
-            return {
-              ok: false,
-              error: 'NEED_INDEPENDENT_JUDGES',
-              got: cmp.judgeCount,
-              total: cmp.totalVerdicts,
-              hint: `**没有提交** —— 需要**至少两个独立的判题员**各自判过这道题，`
-                + `现在只登记了 ${cmp.judgeCount} 个。\n`
-                + '做法：用 spawn_teammate 开两个判题员（如 grader-1 / grader-2），'
-                + '把**同一张截图路径**和题量分别发给它们，'
-                + '让它们各自 `read_image` 读图、各自用 cx_verdict 登记结论。\n'
-                + '★ 别把它们互相的答案、也别把你自己那份告诉它们 —— 一说就带偏了。\n'
-                + '★ 你自己也要读图定一份，最后三方比对。',
-            }
-          }
-
-          // ★ 判题员与你要提交的不一致 → 拦下来，要求先评审
-          if (cmp.dissenting.length && !afterReview) {
-            return {
-              ok: false,
-              error: 'JUDGES_DISAGREE',
-              yours: ansKeys,
-              agreement: { judges: cmp.judgeCount, dissenting: cmp.dissenting.length },
-              judges: verdicts.map((v) => ({
-                judge: String(v.agentId).slice(0, 12),
-                answers: v.answers,
-                uncertain: v.uncertain ?? [],
-              })),
-              hint: '**没有提交** —— 你和判题员的结论不一致。\n'
-                + '\n**先评审**，别急着选一个：\n'
-                + '  1. 对有分歧的那几题，用 `cx_shot({ clip })` 单独截一张特写（清晰得多）\n'
-                + '  2. 把特写再发给两个判题员各看一次\n'
-                + '  3. 定下来之后，带 `afterReview: true` 再提交\n'
-                + '实在定不下来的：cx_note({ tag:"pending" }) 交给用户，**不要猜**。',
-            }
-          }
-
-          const applied = await ACT.answerQuiz(work, { answers: ansKeys })
-          await new Promise((r) => setTimeout(r, 800))
-          const after = await OBS.readQuizContent(work)
-
-          const verify = Object.entries(ansKeys).map(([k, want]) => {
-            const qq = after.questions?.[Number(k) - 1]
-            const got = (qq?.options ?? []).filter((o) => o.chosen).map((o) => o.letter)
-            return { q: k, want, got, ok: want.every((x) => got.includes(x)) && got.length === want.length }
-          })
-          if (!verify.every((v) => v.ok)) {
-            result = {
-              ok: false, error: 'ANSWER_MISMATCH', applied, verify,
-              hint: '浏览器里选中的与预期不符，已拒绝提交。请检查题号和选项。',
-            }
-            break
-          }
-
-          await ACT.submitQuiz(work)
-          await new Promise((r) => setTimeout(r, 2500))
-          const fin = await OBS.readQuizContent(work)
-          const fullScore = fin.fullScore ?? 100
-          const lostPoints = fin.submitted && typeof fin.score === 'number' && fin.score < fullScore
-          result = {
-            ok: !!fin.submitted,
-            status: fin.submitted ? 'SUBMITTED' : 'SUBMIT_NOT_CONFIRMED',
-            score: fin.score, fullScore: fin.fullScore, attempts: fin.attempts,
-            applied, verify,
-            hint: fin.submitted ? null : '提交后没读到成绩，可能确认框没点上。重试一次；仍失败就截图问用户。',
-            // ★ 没拿满分：这一页现在是**批阅回顾视图**，上面标着哪题错了。
-            //   让模型看一眼、把错的知识点记进 cx_note —— 这就是"从错里学"。
-            ...(lostPoints ? {
-              scoreGap: {
-                lost: fullScore - fin.score,
-                hint: `没拿满分（${fin.score}/${fullScore}）。这一页现在是**批阅回顾**，`
-                  + '上面能看出是哪几题错了。**看一眼**：如果是个知识点上的错（不是粗心），'
-                  + '用 cx_note({ add: "…", tag: "lesson" }) 记下来，同类题下次别再错。'
-                  + '（学习通一般不允许重做，不要尝试重复提交。）',
-              },
-            } : {}),
-          }
-          if (fin.submitted) record({ note: `自动作答 ${fin.score}/${fin.fullScore}` })
-          break
-        }
-
-        // ── 只有三个动作。判断归大模型，记录走 cx_note ──────────────────────
-        default:
-          return {
-            ok: false,
-            error: 'BAD_ACTION',
-            action,
-            allowed: ['play', 'read', 'answer'],
-            hint: 'cx_do 只做这三件明确的事。\n'
-              + '如果你判断这个任务点**不该做 / 做不到**（听力题、看视频才能做的题、'
-              + '讨论帖、看不懂的模块），用 cx_note({ add: "…", tag: "pending" }) 记下来，'
-              + '然后继续干别的 —— 别停下来找用户。\n'
-              + '主动跳过的用 tag: "skip"。\n'
-              + '（真正要当场打断用户的只有：图形验证码 / 未登录 / 熔断额度 / 人脸抓拍。）',
-          }
-      }
-
-      // 做完重新清点这一页，把最新事实交回给大模型
-      await new Promise((r) => setTimeout(r, 1000))
-      const after = await inventory(work, { tabs })
-      return {
-        ...result,
-        action,
-        key: item.key ?? null,
-        t: Number(wantT),
-        autoSwitchedTo: switched,          // 非 null 表示工具替你先切了页
-        itemKind: item.kind,
-        pageAfter: {
-          tab: after.tab,
-          tabIndex: after.tabIndex,
-          items: after.items.map((x) => ({ key: x.key, t: x.t, kind: x.kind, loaded: x.loaded })),
-          tpTotal: after.tpTotal,
-          tpUndone: after.tpUndone,
-          pageFacts: after.pageFacts,
-        },
-        fact: 'tpUndone > 0 说明这一页还有任务点没完成；= 0 说明这一页可以翻篇了。'
-          + '下一步做什么由你判断 —— 继续 cx_do、翻页、还是记下来。',
-      }
-    }),
+      const work = await getWork({ targetId: want.id, relaunch: true })
+      const url = await work.eval('location.href').catch(() => want.url)
+      return { ok: true, bound: { id: work.targetId, url }, tabs: await tabsOf(session.browser), changed: `换到了 ${url}` }
+    },
   })
+
+  // ═════════════════════════════════════════════════════════════════════════
+  //  必要（4）—— 只有这两类动作需要代码兜住
+  //   ① 涉及铁律  ② 做错回不了头
+  // ═════════════════════════════════════════════════════════════════════════
+
+  reg({
+    name: 'hand_play',
+    description:
+      '让这一页上的媒体（视频 / 音频）**真播到底**。\n'
+      + '铁律由代码守：原速 1x、永不拖进度条、永不伪造心跳。参数里**故意没有**倍速、跳转、心跳 —— 想都别想。',
+    parameters: {
+      type: 'object',
+      properties: { maxMinutes: { type: 'number', description: '最多守多久，默认 12 分钟' } },
+      additionalProperties: false,
+    },
+    isConcurrencySafe: () => false,
+    serial: true,
+    async run({ maxMinutes }) {
+      const work = await getWork()
+      const r = await HAND.playMedia(work, { maxMinutes })
+      const url = await work.eval('location.href').catch(() => null)
+      if (r?.finished) NT.markDone(url, 'media')
+      return {
+        ok: true,
+        ...r,
+        changed: r?.finished
+          ? `播完了（${Math.round(r?.playedSeconds ?? 0)} 秒）`
+          : `没播完：${r?.reason ?? '未知'}`,
+        hint: r?.finished
+          ? '播完了。**再 eye_see 看一眼确认那个标记变了** —— 不要凭感觉。'
+          : '被中断了。处理掉挡路的东西（弹窗之类）再 hand_play 一次；如果是要人动手，记 hand_note 交给用户。',
+      }
+    },
+  })
+
+  reg({
+    name: 'hand_submit',
+    description:
+      '★ 把这一页上**你已经弄好的东西**交上去。\n'
+      + '它**不接受任何答案** —— 答案是你用 hand_pick / hand_write 亲手弄在页面上的，工具直接读页面。\n'
+      + '交之前会**自己再复核一遍**：没有有效票据就交不出去，页面一动不动。',
+    parameters: {
+      type: 'object',
+      properties: {
+        confirm: { type: 'boolean', description: '必须为 true —— 这是"我确认交"的明确表态' },
+        reviewed: { type: 'string', description: 'eye_check 给的票据 token' },
+        button: { type: 'object', description: '"交"那个按钮的定位' },
+      },
+      required: ['confirm', 'reviewed', 'button'],
+      additionalProperties: false,
+    },
+    isConcurrencySafe: () => false,
+    serial: true,
+    async run({ reviewed, button }) {
+      const work = await getWork()
+      const before = await work.eval('location.href').catch(() => null)
+      const r = await SEE.readAreas(work, { full: false })
+      const areas = r.areas ?? []
+      const ledger = GATE.buildLedger(areas)
+      const lh = GATE.ledgerHash(ledger)
+      const fingerprint = GATE.pageFingerprint({ targetId: work.targetId, url: r.url, areas })
+      const entries = Object.entries(session.verdicts[lh] ?? {}).map(([id, v]) => ({ id, ...v }))
+
+      // ★ 不信任何口头承诺：票据对不上现在的页面/登记，就不交
+      const tk = GATE.verifyToken(reviewed, { fingerprint, ledgerHash: lh })
+      if (!tk.ok) {
+        return {
+          ok: false, category: 'USAGE', error: tk.code, error_detail: tk.text,
+          hint: '先跑 eye_check({}) 拿票据。空着的、越界的、复核员不够两份、三份不一致 —— 任一条不过就没有票据。',
+        }
+      }
+
+      // ★ 票据只是"你看过一次"；这里**自己再走一遍**七条
+      const hit = await SEE.findElementByLocator(work, button).catch(() => ({ found: false }))
+      const gate = GATE.checkGate({
+        areas, ledger, entries, submitButton: button,
+        submitFound: Boolean(hit?.found && hit.visible !== false),
+      })
+      if (!gate.pass) {
+        return {
+          ok: false, category: 'USAGE', error: gate.verdict,
+          problems: gate.problems.map((p) => p.text),
+          hint: '刚才复核没通过 —— 页面一下都没动。回去把那几处定下来，重新 eye_check 拿新票据。',
+        }
+      }
+
+      const click = await HAND.clickLocator(work, button, { settleMs: 2500 })
+
+      // 交完回读：分数 / 是不是弹出了二次确认
+      const after = await SEE.readAreas(work, { full: false }).catch(() => ({ areas: [] }))
+      const scoreText = await work.eval(
+        `(() => { const t = document.body ? document.body.innerText : '';`
+        + ` const m = t.match(/(\\d+(?:\\.\\d+)?)\\s*\\/\\s*(\\d+(?:\\.\\d+)?)/);`
+        + ` return m ? { score: parseFloat(m[1]), full: parseFloat(m[2]) } : null })()`,
+      ).catch(() => null)
+
+      const confirmBtn = (after.areas ?? []).find((a) => a.kind === 'button' && !(r.areas ?? []).some((b) => b.i === a.i))
+
+      NT.markDone(r.url, 'submit')
+
+      const out = {
+        ok: true,
+        urlBefore: before, urlAfter: click.urlAfter, navigated: click.navigated,
+        score: scoreText?.score ?? null,
+        fullScore: scoreText?.full ?? null,
+        changed: click.navigated ? `交完跳到了 ${click.urlAfter}` : '交了（页面没跳转）',
+      }
+      if (typeof out.score === 'number' && typeof out.fullScore === 'number' && out.score < out.fullScore) {
+        out.scoreGap = out.fullScore - out.score
+        out.hint = '没拿满分。这一页现在是批阅视图，**看一眼哪几处错了**：'
+          + '知识点上的错就用 hand_note({ tag:"lesson" }) 记下来。一般不给重做，**不要重复提交**。'
+      }
+      if (confirmBtn) {
+        out.needConfirm = { i: confirmBtn.i, text: confirmBtn.label }
+        out.hint = '弹出了一个确认框。用 hand_click 点它上面那个按钮：'
+          + `hand_click({ i: ${JSON.stringify(confirmBtn.i)} })。`
+      }
+      return out
+    },
+  })
+
+  reg({
+    name: 'hand_note',
+    description:
+      '★ 你的笔记本，也是给用户的待办清单。三种用法：add（写一条）/ read:true（读全部）/ clear（清某一类）。\n'
+      + 'tag：lesson（你摸出来的规律，下次 eye_open 会带回来）/ pending（要交给用户的）/ skip（你主动跳过的）。\n'
+      + '⚠️ **笔记里永远不许写答案** —— 只写规律和待办。',
+    parameters: {
+      type: 'object',
+      properties: {
+        add: { type: 'string', description: '要记下的一条' },
+        tag: { type: 'string', enum: ['lesson', 'pending', 'skip', 'general'], description: '分类，默认 general' },
+        read: { type: 'boolean', description: 'true = 读出全部' },
+        clear: { type: 'string', enum: ['lesson', 'pending', 'skip', 'general', 'all'], description: '清空某一类' },
+      },
+      additionalProperties: false,
+    },
+    isConcurrencySafe: () => true,
+    async run(args) {
+      if (args.read) {
+        const notes = NT.loadNotes()
+        return {
+          ok: true, total: notes.length, notes,
+          summary: NT.summary(),
+          remember: '⚠️ 笔记是经验不是事实 —— 页面可能变了，先看一眼再信它。',
+        }
+      }
+      if (args.clear) return { ok: true, ...NT.clearNotes(args.clear) }
+      const r = NT.addNote(args.tag, args.add)
+      return { ok: true, ...r, summary: NT.summary(), hint: '记下了。继续干活，别停下来找用户。' }
+    },
+  })
+
+  reg({
+    name: 'hand_verdict',
+    description:
+      '★ **复核员专用**：把你的复核结论登记下来。主脑调它会返回 LEAD_CANNOT_JUDGE（那是对的）。\n'
+      + 'picks 的键 = 主脑给你的**编号清单**里的 n（不是题号，是"从上到下第几处"）；'
+      + '值 = 图上看得见的标签（"A" / "B" / "对" / "错"）。\n'
+      + '不登记的话，主脑根本交不出去。',
+    parameters: {
+      type: 'object',
+      properties: {
+        picks: { type: 'object', description: '{"1":["B"],"2":["对"]} —— 编号 → 你选的标签' },
+        uncertain: { type: 'array', items: { type: 'number' }, description: '拿不准的那几处编号（**不要猜**）' },
+        round: { type: 'number', description: '第几轮看的（重看之后填 2，可选）' },
+        note: { type: 'string', description: '一句话说明（可选）' },
+      },
+      required: ['picks'],
+      additionalProperties: false,
+    },
+    isConcurrencySafe: () => true,
+    async run({ picks, uncertain, round, note }, exec) {
+      const work = await getWork()
+      const r = await SEE.readAreas(work, { full: false })
+      const areas = r.areas ?? []
+      const ledger = GATE.buildLedger(areas)
+      const lh = GATE.ledgerHash(ledger)
+      const valid = new Set(ledger.map((x) => String(x.n)))
+
+      const bad = Object.keys(picks).filter((k) => !valid.has(k))
+      if (bad.length) {
+        return {
+          ok: false, category: 'ARG',
+          error: `你登记的编号 ${bad.join('/')} 不在这一页的清单里`,
+          expected: `这一页要复核的编号是：${[...valid].join('、') || '（没有）'}`,
+          example: '{"picks":{"1":["B"],"2":["对"]},"uncertain":[3]}',
+        }
+      }
+      const missing = [...valid].filter((n) => !(n in picks) && !uncertain.includes(Number(n)))
+      if (missing.length) {
+        return {
+          ok: false, category: 'USAGE', error: 'REVIEW_INCOMPLETE',
+          missing,
+          expected: `第 ${missing.join('、')} 处你既没给结论、也没说拿不准`,
+          hint: '定下来的写进 picks；拿不准的写进 uncertain —— 但**不要猜**。看不清就回 {"__need_shot":[编号]}。',
+        }
+      }
+
+      // ★ 身份由 ctx.agents 判定，**不靠自报** —— 复核员只有一份「当前结论」，重登记整体覆盖
+      const judgeId = exec?.agent?.id ?? 'unknown-reviewer'
+      session.verdicts[lh] = session.verdicts[lh] ?? {}
+      session.verdicts = GATE.recordVerdict(session.verdicts, {
+        ledgerHash: lh, judgeId, picks, uncertain, round, note,
+      })
+      session.lastToken = null       // 登记变了 → 旧票据作废（页面指纹里也含 filled，这里再保一道）
+
+      const s = GATE.judgeSummary(session.verdicts, lh)
+      return {
+        ok: true,
+        registered: s.registered,
+        judges: s.judges,
+        note: '已登记。主脑会拿你这份、另一个复核员那份、以及它自己在页面上选的那份，三份比对。',
+      }
+    },
+  })
+
+  return { name }
 }
+
+export default { name, apply }
