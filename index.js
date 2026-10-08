@@ -50,7 +50,7 @@ const DEFAULT_PORT = 9222
 const DEFAULT_PROFILE = ST.STATE_DIR.replace(/\\/g, '/') + '/browser-profile'
 
 // ── 会话句柄（纯基建，不含任何业务判断）────────────────────────────────────
-let session = { browser: null, work: null, course: null, section: null, tabs: [], tree: null, treeAt: 0 }
+let session = { browser: null, work: null, course: null, section: null, tabs: [], tree: null, treeAt: 0, verdicts: [] }
 let running = false   // 串行闸门：学习通禁止同账号并行
 
 /**
@@ -389,6 +389,24 @@ export function apply(ctx, config = {}) {
     output: objOut,
     execute: async (args, exec) => {
       applyOutputDir(exec)
+
+      // ★ 唯一的例外：cx_verdict 只给**判题员**用，所以闸门正好反过来。
+      //   它不是浏览器操作，只是"登记我的判题结论"，给主脑用没意义。
+      if (def.name === 'cx_verdict') {
+        const id = exec?.agent?.id
+        if (id) {
+          const sub = isSubagent(id)
+          if (sub === false) {
+            return {
+              ok: false, error: 'COMMANDER_CANNOT_JUDGE',
+              hint: 'cx_verdict 是给**判题员**登记结论用的，主脑不该调它。\n'
+                + '你是主脑：自己也读图定一份答案，然后在脑子里和判题员比 —— 不用登记。',
+            }
+          }
+        }
+        return toLossless(await def.execute(args, exec))
+      }
+
       const denied = commanderGuard(def, exec)
       if (denied) return denied
       if (def.name === 'cx_open') fallbackOwner = exec?.agent?.id ?? fallbackOwner
@@ -502,6 +520,70 @@ export function apply(ctx, config = {}) {
       }
       // 默认读
       return { ok: true, ...ST.noteDigest(50), all: ST.loadNotes() }
+    },
+  })
+
+  // ═════════════════════════════════════════════════════════════════════════
+  //  cx_verdict —— ★ 判题员专用：把独立判出来的答案登记下来
+  // ═════════════════════════════════════════════════════════════════════════
+  //
+  //  为什么要有它（实测教训 2026-10-08 第三次会话）：
+  //
+  //    那次 6 道测验，把主脑提交的答案和判题员给的答案逐条比对 —— **一字不差**。
+  //    主脑在"转发"，自己根本没做题。所以那一次实质上只有**一份判断**，
+  //    判题员把一道判断题当成多选时，就再也没人兜住 → 20 分。
+  //
+  //    用户的要求是「开两个智能体分开做题，有异议再评审」。
+  //    但光靠提示词要求，主脑完全可以只开一个、或者开了不理会。
+  //
+  //  所以做成机制：
+  //    · 判题员判完，调 cx_verdict 登记（**主脑调会被拒**，闸门反过来）
+  //    · cx_do({action:"answer"}) 会检查：**至少两个不同判题员**登记过
+  //    · 登记结论与主脑要提交的不一致 → **拦下来**，要求先评审
+  //
+  //  这样"三方独立作答"就不是一句请求，而是过不去的关卡。
+  reg({
+    name: 'cx_verdict',
+    description:
+      '**判题员专用。** 把你独立判出来的答案登记下来，让主脑能核对。\n' +
+      '（主脑调它会被拒 —— 它该自己读图定答案，不登记。）\n' +
+      'answers 格式和主脑提交时一样：`{"1":["A"],"2":["B","C"]}`，**每一题都要给**。\n' +
+      '拿不准的题号放进 `uncertain`（不要猜）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        answers: { type: 'object', description: '题号 → 选项数组，如 {"1":["A"],"2":["B","C"]}' },
+        uncertain: { type: 'array', items: { type: 'number' }, description: '拿不准的题号' },
+        note: { type: 'string', description: '一句话说明（可选）' },
+      },
+      required: ['answers'],
+      additionalProperties: false,
+    },
+    isConcurrencySafe: () => true,
+    async execute({ answers, uncertain, note } = {}, exec) {
+      const id = exec?.agent?.id ?? '(unknown)'
+      const list = session.verdicts ?? (session.verdicts = [])
+      // 同一个判题员重复登记只保留最新一条（它可能在补一张特写后改口）
+      const prev = list.findIndex((v) => v.agentId === id)
+      const entry = {
+        agentId: id,
+        answers: answers ?? {},
+        uncertain: Array.isArray(uncertain) ? uncertain : [],
+        note: note ?? null,
+        at: Date.now(),
+      }
+      if (prev >= 0) list[prev] = entry
+      else list.push(entry)
+      const judges = new Set(list.map((v) => v.agentId)).size
+      return {
+        ok: true,
+        recorded: true,
+        judgeCount: judges,
+        totalVerdicts: list.length,
+        hint: judges < 2
+          ? `目前只有 ${judges} 个判题员登记。主脑还需要**至少两个独立判题员**才能提交。`
+          : '已登记。主脑会拿你这份和另一份、以及它自己那份比对。',
+      }
     },
   })
 
@@ -1084,12 +1166,17 @@ export function apply(ctx, config = {}) {
         action: { type: 'string', enum: ['play', 'read', 'answer'] },
         answers: { type: 'object', description: 'action=answer 时：题号 → 选项数组，如 {"1":["A","B"]}' },
         maxMinutes: { type: 'number', description: 'action=play 的时长上限，默认 12 分钟' },
+        afterReview: {
+          type: 'boolean',
+          description: 'action=answer 时：判题员和你不一致、你已经评审过（补了特写、重新比对）才传 true。'
+            + '不传就会被 JUDGES_DISAGREE 拦下。',
+        },
       },
       required: ['action'],
       additionalProperties: false,
     },
     isConcurrencySafe: () => false,
-    execute: serial(async ({ key, t, action, answers, maxMinutes } = {}) => {
+    execute: serial(async ({ key, t, action, answers, maxMinutes, afterReview = false } = {}) => {
       const work = await getWork(ctx)
       if (!(await OBS.isLoggedIn(work))) return { ok: false, error: 'NOT_LOGGED_IN' }
 
@@ -1168,6 +1255,9 @@ export function apply(ctx, config = {}) {
         // ── 读题：只读 ────────────────────────────────────────────────────
         case 'read': {
           if (item.kind !== 'quiz') return { ok: false, error: 'NOT_A_QUIZ', kind: item.kind }
+          // ★ 新一轮判题：清空上一题的判题员登记。
+          //   这样 answer 检查的必然是"这一张图"的独立结论，不会拿上一题的凑数。
+          session.verdicts = []
           const q = await OBS.waitForQuizLoaded(work, { timeoutMs: 40_000 })
           // ★ 顺手截图：因为题干和选项的 DOM 文字**可能全是乱码**，
           //   "读题"这个动作天然就需要那张图。合并成一步，Agent 少一次调用、也不会忘。
@@ -1238,6 +1328,50 @@ export function apply(ctx, config = {}) {
                 letters: (q.options ?? []).map((o) => o.letter).filter(Boolean),
               })),
               hint: CHK.describeShapeProblems(shape),
+            }
+          }
+
+          // ★★ 独立判题员闸门：**至少两个不同判题员**登记过结论才允许提交。
+          //
+          //   实测教训：上一次 6 道测验，主脑提交的答案和判题员给的**一字不差** ——
+          //   它在转发，实质上只有一份判断，判题员错了就没人兜住 → 20 分。
+          //   用户要求"开两个智能体分开做题"，光靠提示词要求不住，所以做成关卡。
+          const verdicts = session.verdicts ?? []
+          const cmp = CHK.compareJudgeAnswers(ansKeys, verdicts)
+          if (!cmp.enough) {
+            return {
+              ok: false,
+              error: 'NEED_INDEPENDENT_JUDGES',
+              got: cmp.judgeCount,
+              total: cmp.totalVerdicts,
+              hint: `**没有提交** —— 需要**至少两个独立的判题员**各自判过这道题，`
+                + `现在只登记了 ${cmp.judgeCount} 个。\n`
+                + '做法：用 spawn_teammate 开两个判题员（如 grader-1 / grader-2），'
+                + '把**同一张截图路径**和题量分别发给它们，'
+                + '让它们各自 `read_image` 读图、各自用 cx_verdict 登记结论。\n'
+                + '★ 别把它们互相的答案、也别把你自己那份告诉它们 —— 一说就带偏了。\n'
+                + '★ 你自己也要读图定一份，最后三方比对。',
+            }
+          }
+
+          // ★ 判题员与你要提交的不一致 → 拦下来，要求先评审
+          if (cmp.dissenting.length && !afterReview) {
+            return {
+              ok: false,
+              error: 'JUDGES_DISAGREE',
+              yours: ansKeys,
+              agreement: { judges: cmp.judgeCount, dissenting: cmp.dissenting.length },
+              judges: verdicts.map((v) => ({
+                judge: String(v.agentId).slice(0, 12),
+                answers: v.answers,
+                uncertain: v.uncertain ?? [],
+              })),
+              hint: '**没有提交** —— 你和判题员的结论不一致。\n'
+                + '\n**先评审**，别急着选一个：\n'
+                + '  1. 对有分歧的那几题，用 `cx_shot({ clip })` 单独截一张特写（清晰得多）\n'
+                + '  2. 把特写再发给两个判题员各看一次\n'
+                + '  3. 定下来之后，带 `afterReview: true` 再提交\n'
+                + '实在定不下来的：cx_note({ tag:"pending" }) 交给用户，**不要猜**。',
             }
           }
 

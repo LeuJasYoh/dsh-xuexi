@@ -367,5 +367,94 @@ t('cx_do answer 真的接上了形状检查（且在点击之前）', () => {
   assert.ok(iShape > 0 && iClick > 0 && iShape < iClick, '形状检查必须在点击之前')
 })
 
+console.log('\n═══ 八、三方独立判题（用户要求：开两个智能体 + 有异议评审）═══\n')
+
+const V1 = { 1: ['D'], 2: ['A', 'B', 'C', 'D'], 3: ['A'] }
+const V2 = { 1: ['D'], 2: ['A', 'B', 'C', 'D'], 3: ['A'] }
+const V3 = { 1: ['D'], 2: ['A', 'B', 'C', 'D'], 3: ['B'] }
+
+t('normalizeAnswers：选项顺序和写法不影响比较', () => {
+  assert.equal(CHK.normalizeAnswers({ 2: ['C', 'A'], 1: ['b'] }), CHK.normalizeAnswers({ 1: ['B'], 2: ['A', 'C'] }))
+  assert.equal(CHK.normalizeAnswers({ 1: 'A,B' }), CHK.normalizeAnswers({ 1: ['B', 'A'] }), '字符串写法也要认')
+})
+
+t('只有一个判题员 → 不够，拦下', () => {
+  const r = CHK.compareJudgeAnswers(V1, [{ agentId: 'g1', answers: V1 }])
+  assert.equal(r.enough, false)
+  assert.equal(r.ok, false)
+  assert.equal(r.judgeCount, 1)
+})
+
+t('同一个判题员登记两次 → 仍只算一个', () => {
+  const r = CHK.compareJudgeAnswers(V1, [
+    { agentId: 'g1', answers: V1 }, { agentId: 'g1', answers: V1 },
+  ])
+  assert.equal(r.judgeCount, 1, '同一人重复登记不能凑数')
+  assert.equal(r.enough, false)
+})
+
+t('两个判题员 + 结论一致 + 和主脑一致 → 放行', () => {
+  const r = CHK.compareJudgeAnswers(V1, [
+    { agentId: 'g1', answers: V1 }, { agentId: 'g2', answers: V2 },
+  ])
+  assert.equal(r.judgeCount, 2)
+  assert.equal(r.ok, true)
+  assert.equal(r.dissenting.length, 0)
+})
+
+t('★ 两个判题员，其中一个和主脑不一致 → 拦下并要求评审', () => {
+  const r = CHK.compareJudgeAnswers(V1, [
+    { agentId: 'g1', answers: V1 }, { agentId: 'g2', answers: V3 },
+  ])
+  assert.equal(r.enough, true, '人数够')
+  assert.equal(r.ok, false, '但有异议，不该放行')
+  assert.equal(r.dissenting.length, 1)
+  assert.equal(r.dissenting[0].agentId, 'g2')
+})
+
+t('cx_verdict 已注册，且端口是"判题员专用"（闸门反过来）', async () => {
+  const vt = tools.find((x) => x.name === 'cx_verdict')
+  assert.ok(vt, '没注册 cx_verdict')
+  assert.ok(vt.parameters.required.includes('answers'), 'answers 应该是必填')
+  const src = fs.readFileSync(path.join(PLUGIN, 'index.js'), 'utf8')
+  assert.ok(/COMMANDER_CANNOT_JUDGE/.test(src), '缺少"主脑不能判题"的守卫')
+})
+
+t('★ 主脑调 cx_verdict 会被拒（闸门是反的）', async () => {
+  const vt = tools.find((x) => x.name === 'cx_verdict')
+  // mock ctx 里 agents.isOwnedBy 恒为 false → 当前 agent 不是子智能体 → 是主脑
+  const r = await vt.execute({ answers: { 1: ['A'] } }, { agent: { id: 'MAIN' } })
+  assert.equal(r.ok, false, '主脑不该能登记判题结论')
+  assert.equal(r.error, 'COMMANDER_CANNOT_JUDGE')
+})
+
+t('cx_do 有 afterReview 参数（评审完之后才能带异议提交）', () => {
+  const cxd = tools.find((x) => x.name === 'cx_do')
+  assert.ok(cxd.parameters.properties.afterReview, '缺 afterReview 参数')
+})
+
+t('cx_do answer 的闸门顺序：覆盖 → 形状 → 判题员 → 点击', () => {
+  const src = fs.readFileSync(path.join(PLUGIN, 'index.js'), 'utf8')
+  const i = (s) => src.indexOf(s)
+  const order = [
+    i('CHK.checkAnswerCoverage('),
+    i('CHK.checkAnswerShape('),
+    i('CHK.compareJudgeAnswers('),
+    i('ACT.answerQuiz('),
+  ]
+  for (const x of order) assert.ok(x > 0, '找不到某个闸门')
+  for (let k = 1; k < order.length; k++) {
+    assert.ok(order[k - 1] < order[k], `闸门顺序错了：第 ${k} 个应该在前面`)
+  }
+})
+
+t('cx_do read 会清空上一轮的判题登记（不同题的结论不能混用）', () => {
+  const src = fs.readFileSync(path.join(PLUGIN, 'index.js'), 'utf8')
+  const iRead = src.indexOf("case 'read': {")
+  const iAnswer = src.indexOf("case 'answer': {")
+  const body = src.slice(iRead, iAnswer)
+  assert.ok(/session\.verdicts = \[\]/.test(body), 'read 里没清空 verdicts')
+})
+
 console.log(`\n═══ 结果：${pass} 通过 / ${fail} 失败 ═══\n`)
 process.exit(fail ? 1 : 0)
