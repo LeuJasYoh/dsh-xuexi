@@ -114,8 +114,8 @@ async function resolveCourse(work, name) {
   return { all, course }
 }
 
-async function getWork(ctx, { relaunch = false } = {}) {
-  if (!relaunch && session.browser && session.work) {
+async function getWork(ctx, { relaunch = false, preferForeground = false } = {}) {
+  if (!relaunch && !preferForeground && session.browser && session.work) {
     try {
       await listPages(session.browser)
       // ⚠️ 光确认"浏览器还在"不够 —— 浏览器活着**不代表页面会话没死**。
@@ -134,7 +134,18 @@ async function getWork(ctx, { relaunch = false } = {}) {
     port: state.browser?.port ?? DEFAULT_PORT,
     profileDir: state.browser?.profileDir ?? DEFAULT_PROFILE,
   })
-  const work = await ensureWorkTab(browser, { targetId: relaunch ? null : state.browser?.workTargetId })
+  // ★ preferForeground：重新挑一次标签页，**优先用户在看的那个**。
+  //
+  //   实测事故（用户直接指出的）：用户自己在浏览器里翻到了「马原章节任务点」，
+  //   然后叫 DSH 开始；DSH 却认准了自己状态里记的那个旧标签页（还停在课程页），
+  //   把**它**导航到了章节页 —— 用户翻好的那一页从头到尾没被看见。
+  //
+  //   所以 cx_open（明确的"从这儿开始"）会带 preferForeground: true，
+  //   重新绑定；干活中途不动，免得把正在播的视频切走。
+  const work = await ensureWorkTab(browser, {
+    targetId: (relaunch || preferForeground) ? null : state.browser?.workTargetId,
+    preferForeground: preferForeground || relaunch,
+  })
   // 每次都把实际用的标签页写回状态：
   // ensureWorkTab 可能复用了"用户正在用的那一页"（而不是记录里的旧 id），
   // 不同步的话下次又会找错。
@@ -153,7 +164,37 @@ async function getWork(ctx, { relaunch = false } = {}) {
 
 const objOut = {
   schema: { type: 'object', additionalProperties: true },
-  render: (_args, value) => [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }],
+  render: (_args, value) => {
+    // ★ 关键修复：把截图**真的交给模型看**，而不是只给一个文件路径。
+    //
+    //   实测事故（2026-10-08 发现，最严重的一个）：
+    //   旧版 cx_shot 只返回 `{ file: "…png" }` —— 内容是纯文本，
+    //   模型**根本看不到图**。于是它只能去读被字体混淆的 DOM 硬猜，
+    //   日志里它自己写了「题干+选项都被替换字混淆，但可用上下文语义还原
+    //   （圪盾=矛盾、圧性=属性）」—— 那就是在猜。猜对是运气，不是能力。
+    //
+    //   DSH 的 ContentBlock 支持真正的图片块：
+    //     { type: 'image', attachment: ImageAttachmentRef }
+    //   ImageAttachmentRef = { attachmentId, mediaType, bytes, width, height, name? }
+    //
+    //   实现方式：截图工具把附件的 ref 放进返回值的 `__images`（内部约定），
+    //   这里取出来渲染成图片块，同时把 `__images` 从给模型看的文字里摘掉。
+    let v = value
+    let images = []
+    if (v && typeof v === 'object' && !Array.isArray(v) && Array.isArray(v.__images)) {
+      images = v.__images
+      const { __images, ...rest } = v
+      v = rest
+    }
+    const blocks = [{
+      type: 'text',
+      text: typeof v === 'string' ? v : JSON.stringify(v, null, 2),
+    }]
+    for (const attachment of images) {
+      if (attachment && attachment.attachmentId) blocks.push({ type: 'image', attachment })
+    }
+    return blocks
+  },
 }
 
 /** 串行闸门的统一包装：任何"做"的动作都不允许并发 */
@@ -166,8 +207,8 @@ function serial(fn) {
   }
 }
 
-/** 截图存盘 —— cx_shot 和 cx_do(read) 共用，避免两处逻辑漂移 */
-async function takeShot(work, { full = false, label = 'shot', clip = null } = {}) {
+/** 截图存盘 + 注册成附件 —— cx_shot 和 cx_do(read) 共用，避免两处逻辑漂移 */
+async function takeShot(ctx, work, { full = false, label = 'shot', clip = null } = {}) {
   const buf = clip
     ? await work.screenshot({ clip })
     : (full ? await work.screenshotFull() : await work.screenshot())
@@ -178,7 +219,25 @@ async function takeShot(work, { full = false, label = 'shot', clip = null } = {}
   mkdirSync(dir, { recursive: true })
   const file = `${dir}\\chaoxing-${safe}-${stamp}.png`
   writeFileSync(file, buf)
-  return { file, bytes: buf.length }
+
+  // ★★ 关键：把它**当成附件存进 DSH**，这样 objOut.render 才能把它
+  //    渲染成真正的图片块交给模型。只写文件、不给 ref 的话，
+  //    模型看到的永远只是一行路径 —— 那就等于没截图（实测踩过这个坑）。
+  let image = null
+  try {
+    const attachments = ctx.get('attachments')
+    if (attachments?.saveImage) {
+      image = await attachments.saveImage({
+        data: new Uint8Array(buf),
+        mediaType: 'image/png',
+        name: `chaoxing-${safe}.png`,
+      })
+    }
+  } catch (e) {
+    // 存附件失败不该让截图整体失败 —— 路径照样给，调用方会看到 imageUnavailable
+    console.error('[dsh-chaoxing] saveImage 失败:', String(e?.message ?? e))
+  }
+  return { file, bytes: buf.length, image }
 }
 
 /**
@@ -328,19 +387,38 @@ export function apply(ctx, config = {}) {
 
   reg({
     name: 'cx_open',
-    description: '接管自动化浏览器并打开学习通。返回登录状态。未登录时请用户扫码（绝不代填账号密码）。幂等。',
+    description: '接管浏览器，并**绑定到你正在看的那个学习通标签页**。返回登录状态和你以前的笔记。'
+      + '那一页若已在学习通上，**不会导航、不会动它**。未登录时请用户扫码（绝不代填账号密码）。幂等。',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     isConcurrencySafe: () => true,
     async execute() {
-      const work = await getWork(ctx)
-      await work.goto(OBS.HOME_URL, { timeoutMs: 30_000 })
+      // ★ preferForeground：cx_open 是明确的"从这儿开始"，要重新绑定到
+      //   **用户正在看的那个学习通标签页**，而不是我们记着的旧标签。
+      const work = await getWork(ctx, { preferForeground: true })
+      const here = await work.eval('location.href').catch(() => null)
+
+      // ★ 只在"不在学习通上"时才导航。
+      //
+      //   旧实现无条件 `goto(HOME_URL)` —— 结果就是用户自己翻好了
+      //   马原章节任务点，cx_open 一来把它冲回首页，用户白翻。
+      //   实测事故 2026-10-08。
+      const onChaoxing = /chaoxing\.com/.test(here || '')
+      if (!onChaoxing) await work.goto(OBS.HOME_URL, { timeoutMs: 30_000 })
+
       const loggedIn = await OBS.isLoggedIn(work)
+      const finalUrl = await work.eval('location.href').catch(() => here)
       return {
         ok: true, port, loggedIn,
-        url: await work.eval('location.href').catch(() => null),
+        url: finalUrl,
+        followedUserTab: !!work.__followedUser,
         // ★ 把「以前学到的」带回来 —— 这就是学习
         notes: ST.noteDigest(10),
-        next: loggedIn ? '已登录 → cx_courses 列课程' : '请在浏览器窗口用学习通 App 扫码，登录后再调一次 cx_open',
+        next: loggedIn
+          ? (onChaoxing
+            ? `已连上你正在看的这一页（${String(finalUrl).slice(0, 70)}）—— **没有动它**。`
+              + '想先看课程结构就 cx_chapters，想直接开刷就 cx_page。'
+            : '已登录 → cx_courses 列课程')
+          : '请在浏览器窗口用学习通 App 扫码，登录后再调一次 cx_open',
       }
     },
   })
@@ -683,11 +761,15 @@ export function apply(ctx, config = {}) {
     isConcurrencySafe: () => true,
     async execute({ full = false, label = 'shot', clip = null } = {}) {
       const work = await getWork(ctx)
-      const shot = await takeShot(work, { full, label, clip })
+      const shot = await takeShot(ctx, work, { full, label, clip })
+      const { image, ...rest } = shot
       return {
-        ok: true, ...shot,
+        ok: true, ...rest,
+        // ★ 这里返回的图会**真的显示给你看**（不是路径）。看图，别读 DOM。
+        imageAttached: !!image,
+        ...(image ? { __images: [image] } : {}),
+        ...(image ? {} : { warn: '图没能附上（附件服务不可用），只能用 file 路径。' }),
         url: await work.eval('location.href').catch(() => null),
-        hint: `把路径 ${shot.file} 直接给用户看（DSH 会自动显示图片）。`,
       }
     },
   })
@@ -1030,11 +1112,17 @@ export function apply(ctx, config = {}) {
           const q = await OBS.waitForQuizLoaded(work, { timeoutMs: 40_000 })
           // ★ 顺手截图：因为题干和选项的 DOM 文字**可能全是乱码**，
           //   "读题"这个动作天然就需要那张图。合并成一步，Agent 少一次调用、也不会忘。
-          const shot = await takeShot(work, { full: true, label: `quiz-${item.key ?? item.t}` })
+          //   图会**真的附在返回里**（见 objOut.render），不是只给路径。
+          const shot = await takeShot(ctx, work, { full: true, label: `quiz-${item.key ?? item.t}` })
             .catch(() => null)
+          const { image, ...shotRest } = shot ?? {}
           result = {
-            ok: !!q.found, quiz: q, shot,
-            shotHint: shot ? `题目原文看这张图：${shot.file}` : null,
+            ok: !!q.found, quiz: q, shot: shotRest,
+            imageAttached: !!image,
+            ...(image ? { __images: [image] } : {}),
+            note: q.obfuscatedStem
+              ? '这一页 DOM 文字被字体混淆 —— **以你看到的图为准**，DOM 只用来数题型/选项个数。'
+              : null,
           }
           break
         }

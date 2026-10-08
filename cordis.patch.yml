@@ -46,3 +46,21 @@
             name: dsh-chaoxing
             config:
               port: 9222
+
+          # ── 文件工具（read / write / edit / read_image）──────────────────
+          #
+          # ⚠️ 为什么要加（实测事故 2026-10-08）：
+          #   预设的 `plugins` 列表**就是一个作用域的白名单** ——
+          #   只写 [persona, chaoxing] 的话，这个模式的 Agent 除了 cx_* 之外
+          #   什么工具都没有。实测日志证实：模型拿到的 30 个工具里
+          #   **没有 read / write / read_image，也没有 subagent**。
+          #
+          #   后果有两个，都是用户直接发现的：
+          #     1. 提示词里写的「判题员用 read_image 读图」根本无从执行 ——
+          #        工具不存在，模型只能自己看图，体力活没派出去；
+          #     2. 模型没法把截图当文件读、也没法自己写笔记文件。
+          #
+          #   `@deepseek-ai/dsh-tool-fs` 提供 read / write / edit / read_image。
+          #   注意它**只在这个预设作用域里**生效，标准模式等其它模式不受影响。
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
