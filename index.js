@@ -1217,6 +1217,30 @@ export function apply(ctx, config = {}) {
             }
           }
 
+          // ★★ 形状检查：答案和题目的「形状」对得上吗 —— 在**点击之前**就拦。
+          //
+          //   实测（2026-10-08 第三次会话）：第 3 题是**判断题**，
+          //   DOM 上只有 A(对) / B(错) 两个选项，模型却给了 ["A","B","C"]。
+          //   下面那个事后守卫确实拦住了提交（这点它做对了），
+          //   但只说了句「请检查题号和选项」—— 模型没看懂，
+          //   改成 ["A"] 重交 → 20 分。
+          //
+          //   所以提前拦，并且把话说清楚：哪一题、几个选项、实际是哪几个字母。
+          const shape = CHK.checkAnswerShape(before.questions ?? [], ansKeys)
+          if (!shape.ok) {
+            return {
+              ok: false,
+              error: 'ANSWERS_SHAPE_MISMATCH',
+              problems: shape.problems,
+              questionsShape: (before.questions ?? []).map((q, i) => ({
+                q: i + 1, kind: q.kind ?? null,
+                optionCount: q.options?.length ?? null,
+                letters: (q.options ?? []).map((o) => o.letter).filter(Boolean),
+              })),
+              hint: CHK.describeShapeProblems(shape),
+            }
+          }
+
           const applied = await ACT.answerQuiz(work, { answers: ansKeys })
           await new Promise((r) => setTimeout(r, 800))
           const after = await OBS.readQuizContent(work)

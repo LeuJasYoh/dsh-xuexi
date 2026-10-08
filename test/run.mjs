@@ -308,5 +308,64 @@ t('cx_do answer 提交后会报告分数差距（没满分时）', () => {
   assert.ok(/scoreGap/.test(src), '没给没满分的提示')
 })
 
+console.log('\n═══ 七、答案形状检查（防「题号/题型错位」）═══\n')
+
+const QS = [
+  { kind: '单选题', options: [{ letter: 'A' }, { letter: 'B' }, { letter: 'C' }, { letter: 'D' }] },
+  { kind: '单选题', options: [{ letter: 'A' }, { letter: 'B' }, { letter: 'C' }, { letter: 'D' }] },
+  { kind: '判断题', isTruth: true, options: [{ letter: 'A' }, { letter: 'B' }] },
+  { kind: '判断题', isTruth: true, options: [{ letter: 'A' }, { letter: 'B' }] },
+  { kind: '判断题', isTruth: true, options: [{ letter: 'A' }, { letter: 'B' }] },
+]
+
+t('★ 真机失败案例：第 3 题是判断题（只有 A/B），模型给了 A、B、C → 拦下并说清', () => {
+  const r = CHK.checkAnswerShape(QS, { 1: ['C'], 2: ['B'], 3: ['A', 'B', 'C'], 4: ['A'], 5: ['B'] })
+  assert.equal(r.ok, false)
+  assert.equal(r.problems.length, 1)
+  assert.equal(r.problems[0].q, 3)
+  assert.equal(r.problems[0].type, 'NO_SUCH_OPTION')
+  assert.deepEqual(r.problems[0].available, ['A', 'B'], '要如实报出这题只有 A、B')
+  const msg = CHK.describeShapeProblems(r)
+  assert.ok(/只有 A、B/.test(msg), '提示要写清这题只有几个选项')
+  assert.ok(/判断题/.test(msg), '提示要写清题型')
+})
+
+t('单选题给两个字母 → 拦下', () => {
+  const r = CHK.checkAnswerShape([{ kind: '单选题', options: [{ letter: 'A' }, { letter: 'B' }] }], { 1: ['A', 'B'] })
+  assert.equal(r.ok, false)
+  assert.equal(r.problems[0].type, 'TOO_MANY_FOR_SINGLE')
+})
+
+t('判断题给两个字母 → 拦下', () => {
+  const r = CHK.checkAnswerShape([{ kind: '判断题', isTruth: true, options: [{ letter: 'A' }, { letter: 'B' }] }], { 1: ['A', 'B'] })
+  assert.equal(r.ok, false)
+  assert.equal(r.problems[0].type, 'TOO_MANY_FOR_SINGLE')
+})
+
+t('多选题只给一个字母 → **只提醒不拦**（只有一个正确项是合法的）', () => {
+  const r = CHK.checkAnswerShape([{ kind: '多选题', options: [{ letter: 'A' }, { letter: 'B' }] }], { 1: ['A'] })
+  assert.equal(r.ok, true, '不该拦 —— 多选题可能只有一个正确项')
+  assert.equal(r.notes.length, 1)
+  assert.equal(r.notes[0].type, 'ONLY_ONE_FOR_MULTI')
+})
+
+t('全套形状正确 → 放行', () => {
+  assert.equal(CHK.checkAnswerShape(QS, { 1: ['C'], 2: ['B'], 3: ['A'], 4: ['A'], 5: ['B'] }).ok, true)
+})
+
+t('读不到选项（optionCount=0）时不误拦', () => {
+  const r = CHK.checkAnswerShape([{ kind: '单选题', options: [] }], { 1: ['A'] })
+  assert.equal(r.ok, true, '选项读不到就不该拦，否则会卡死')
+})
+
+t('cx_do answer 真的接上了形状检查（且在点击之前）', () => {
+  const src = fs.readFileSync(path.join(PLUGIN, 'index.js'), 'utf8')
+  assert.ok(/CHK\.checkAnswerShape\(/.test(src), '没调用 checkAnswerShape')
+  assert.ok(/ANSWERS_SHAPE_MISMATCH/.test(src), '没返回 ANSWERS_SHAPE_MISMATCH')
+  const iShape = src.indexOf('CHK.checkAnswerShape(')
+  const iClick = src.indexOf('ACT.answerQuiz(')
+  assert.ok(iShape > 0 && iClick > 0 && iShape < iClick, '形状检查必须在点击之前')
+})
+
 console.log(`\n═══ 结果：${pass} 通过 / ${fail} 失败 ═══\n`)
 process.exit(fail ? 1 : 0)

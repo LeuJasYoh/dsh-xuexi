@@ -1,6 +1,6 @@
 {
   "name": "dsh-chaoxing",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "DSH 学习通模式：让大模型当司令、脚本当手，在学习通里按真实学习的方式完成课程任务点（原速 / 不拖拽 / 不伪造心跳）",
   "type": "module",
   "license": "MIT",
@@ -43,7 +43,7 @@
   "dsh": {
     "id": "dsh-chaoxing",
     "name": "学习通模式",
-    "version": "1.3.1",
+    "version": "1.3.2",
     "repo": "LeuJasYoh/dsh-chaoxing",
     "engines": {
       "dsh": ">=0.2.0"
