@@ -25,8 +25,9 @@
  *   ② 做错回不了头（交答案，一般不给重做）
  */
 
-import { readFileSync, mkdirSync, writeFileSync } from 'node:fs'
+import { readFileSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { homedir } from 'node:os'
 
 import * as B from './lib/browser.mjs'
 import * as SEE from './lib/see.mjs'
@@ -192,7 +193,45 @@ const LOCATOR_SCHEMA = {
   additionalProperties: false,
 }
 
+/**
+ * 装载自检日志。
+ *
+ * 为什么要有：DSH 的界面只显示「加载失败」四个字，看不到真实报错，
+ * 而插件的报错发生在 host 进程里，我们从外面抓不到。
+ * 所以把装载过程**逐步写进一个文件**：
+ *
+ *     ~/.dsh/xuexi/load-diag.log
+ *
+ * 出问题时读它：有 'module-eval start' 没 'module-eval ok' → import 阶段炸了；
+ * 有 'apply start' 没 'apply done' → apply 里炸了，堆栈就在下面几行。
+ *
+ * ⚠️ 诊断本身绝不能成为故障点 —— 全程 try/catch，写不进去就算了。
+ */
+function diag(msg) {
+  try {
+    const dir = join(homedir(), '.dsh', 'xuexi')
+    mkdirSync(dir, { recursive: true })
+    appendFileSync(join(dir, 'load-diag.log'), `${new Date().toISOString()}  ${msg}\n`)
+  } catch { /* 诊断失败不许影响插件 */ }
+}
+
+diag('module-eval start')
+
 export function apply(ctx, config = {}) {
+  try {
+    const r = applyInner(ctx, config)
+    diag('apply done')
+    return r
+  } catch (e) {
+    diag('APPLY THREW >>> ' + (e?.stack || e?.message || String(e)))
+    throw e
+  }
+}
+
+function applyInner(ctx, config = {}) {
+  diag('apply start  config=' + JSON.stringify(config))
+  diag('  ctx.tools 能拿到吗: ' + (typeof ctx.tools?.register))
+  diag('  systemPrompt 能拿到吗: ' + (typeof ctx.get?.('systemPrompt')?.section))
   const port = config.port ?? DEFAULT_PORT
 
   /** 这次会话的状态（浏览器句柄 + 复核登记簿） */
@@ -356,7 +395,9 @@ export function apply(ctx, config = {}) {
   //   ③ 角色闸门
   //   ④ 干活（定义在 def.run 里）
   //   ⑤ 出口清洗
-  const reg = (def) => ctx.effect(() => ctx.tools.register({
+  const reg = (def) => ctx.effect(() => {
+    diag('register >>> ' + def.name)
+    ctx.tools.register({
     name: def.name,
     description: def.description,
     parameters: def.parameters,
@@ -390,7 +431,9 @@ export function apply(ctx, config = {}) {
       }
       return run()
     },
-  }))
+    })
+    diag('register ok <<< ' + def.name)
+  })
 
   // ═════════════════════════════════════════════════════════════════════════
   //  眼（5）—— 只报事实
@@ -1008,4 +1051,19 @@ export function apply(ctx, config = {}) {
   return { name }
 }
 
-export default { name, apply }
+// ⚠️⚠️ 绝对不要加 `export default`！
+//
+// 实测事故（2.0.0 装机后预设一直「加载失败」，黑匣子抓到的原文）：
+//
+//     APPLY THREW >>> Error: cannot get property "tools" without inject
+//         at applyInner (index.js)
+//
+// 明明写了 `export const inject = ['tools']`，却还是报 "without inject"。
+// 原因：DSH 取插件对象用的是 **`模块的 default ?? 模块本身`**。
+// 我多写了一个 `export default { name, apply }`，DSH 就拿这个对象当插件 ——
+// 而它**没有 inject 字段**，于是那句声明整个被忽略，Cordis 不给注入 tools。
+//
+// 正确形态（和旧版能跑的那份一字不差）：只导出 name / inject / apply 三个具名导出。
+// 测试 F0 专门守这一条。
+
+diag('module-eval ok')

@@ -470,7 +470,20 @@ t('E12 铁律六条还在', () => {
   if (mod.__err) {
     ta('F1 能 import index.js', false, mod.__err.message)
   } else {
-    const inject = Array.isArray(mod.inject) ? mod.inject : []
+    // ★★ 最关键的一条：DSH 取插件对象用的是 **`default ?? 模块本身`**。
+    //   只要存在 default 导出，DSH 就用它 —— 而它若没有 inject，
+    //   那句 `export const inject` 就整个被忽略，启动时报
+    //   `cannot get property "tools" without inject`，预设「加载失败」。
+    //   （实测事故：2.0.0 我多写了一个 `export default { name, apply }`，就是栽在这。）
+    const plugin = mod.default ?? mod
+    ta('F0 插件对象里 inject 含 tools（DSH 用的是 default ?? 模块）',
+      Array.isArray(plugin.inject) && plugin.inject.includes('tools'),
+      mod.default
+        ? `有 default 导出，但它缺 inject —— DSH 会忽略具名导出里的 inject。default 的键：${Object.keys(mod.default).join(',')}`
+        : '既没有 default，具名 inject 也不含 tools')
+    ta('F0b 插件对象上有 apply', typeof plugin.apply === 'function')
+
+    const inject = Array.isArray(plugin.inject) ? plugin.inject : []
     const services = {}
     const registered = []
     if (inject.includes('tools')) services.tools = { register: (def) => registered.push(def) }
@@ -509,7 +522,7 @@ t('E12 铁律六条还在', () => {
     }
 
     try {
-      await mod.apply(ctx, {})
+      await plugin.apply(ctx, {})
       ta('F1 装载成功（apply 没抛）', true)
       const names = registered.map((d) => d.name)
       ta('F2 注册了 15 个工具', registered.length === 15, `实际 ${registered.length}：${names.join(',')}`)
