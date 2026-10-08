@@ -99,8 +99,27 @@ t('A20 hand_tab: i/id 同时给 → ARG', () => eq(A.checkArgs('hand_tab', { i: 
 t('A21 hand_tab: 都不给 → ARG', () => eq(A.checkArgs('hand_tab', {}).ok, false))
 t('A22 hand_tab: i 不是整数 → ARG', () => eq(A.checkArgs('hand_tab', { i: 1.5 }).ok, false))
 
-t('A23 hand_play: 默认 12 分钟', () => eq(A.checkArgs('hand_play', {}).args.maxMinutes, 12))
-t('A24 hand_play: 0 分钟 → ARG', () => eq(A.checkArgs('hand_play', { maxMinutes: 0 }).ok, false))
+t('A23 hand_play: 默认不填时长（工具自己按视频长度算）', () => {
+  const r = A.checkArgs('hand_play', {})
+  eq(r.ok, true)
+  eq(r.args.maxSeconds, null)     // ★ 不给 = 工具自己算，不需要模型猜
+  eq(r.args.rate, null)           // ★ 不给 = 默认 1x，且别人改了不纠
+  eq(r.args.stallSeconds, 25)
+})
+t('A24 hand_play: 0 秒 → ARG', () => eq(A.checkArgs('hand_play', { maxSeconds: 0 }).ok, false))
+t('A24b hand_play: 秒级颗粒度（300 秒可以）', () => eq(A.checkArgs('hand_play', { maxSeconds: 300 }).args.maxSeconds, 300))
+t('A24c hand_play: 用户要求倍速时可以带 rate', () => eq(A.checkArgs('hand_play', { rate: 2 }).args.rate, 2))
+t('A24d hand_play: 离谱倍速（16x）→ ARG', () => eq(A.checkArgs('hand_play', { rate: 16 }).ok, false))
+t('A24e hand_play: 还在用旧参数 maxMinutes → ARG，并告诉它改用 maxSeconds', () => {
+  const r = A.checkArgs('hand_play', { maxMinutes: 12 })
+  eq(r.ok, false); eq(r.category, 'ARG')
+  ta('A24f 提示里点出 maxMinutes 不认了', /maxMinutes/.test(r.error), r.error)
+})
+t('A24g hand_scroll: 可以指定 area / frame', () => {
+  const r = A.checkArgs('hand_scroll', { area: { i: 'r1' }, frame: '主页面', px: 500 })
+  eq(r.ok, true)
+  eq(r.args.area.i, 'r1'); eq(r.args.frame, '主页面')
+})
 
 t('A25 hand_submit: confirm 不是 true → USAGE', () => {
   const r = A.checkArgs('hand_submit', { confirm: false, reviewed: 'tk', button: { i: 'b1' } })
@@ -357,12 +376,24 @@ t('C6 会动手的手都上了串行锁', () => {
     ta(`C6b ${nm} 应有 serial: true`, /serial:\s*true/.test(b.slice(0, 900)))
   }
 })
-t('C7 铁律写进代码：hand_play 参数里没有倍速/跳转/心跳', () => {
+t('C8b eye_see 必须把 marks / layout 透传给模型', () => {
+  // ★ 实测踩过：see.mjs 算出了 marks / layout，index.js 却没往外传 ——
+  //   工具白算了，提示词里那句「eye_see 的 marks 会报给你」是空的。
+  //   读这一层的人不容易发现，所以钉一条断言守它。
+  const i = IDX.indexOf("name: 'eye_see'")
+  const blk = IDX.slice(i, i + 2200)
+  ta('C8c marks 透传', /r\.marks/.test(blk) && /marks\s*,/.test(blk))
+  ta('C8d layout 透传', /r\.layout/.test(blk))
+})
+t('C7 铁律写进代码：hand_play 参数里没有跳转/心跳', () => {
+  // ⚠️ rate 是**允许**的（用户明确要求倍速时才用，见提示词「关于倍速」）；
+  //    seek（跳转）/ heartbeat（伪造心跳）永远不许有。
   const i = IDX.indexOf("name: 'hand_play'")
-  const blk = IDX.slice(i, i + 1200)
-  for (const bad of ['rate', 'seek', 'heartbeat', 'speed', 'playbackRate']) {
+  const blk = IDX.slice(i, i + 2000)
+  for (const bad of ['seek', 'heartbeat', 'jumpTo', 'percent']) {
     ta(`C7b 参数里不该有 ${bad}`, !new RegExp(`${bad}\\s*:`).test(blk))
   }
+  ta('C7c rate 允许（用户要求倍速用）', /rate\s*:/.test(blk))
 })
 t('C8 hand_submit 不收答案（参数里没有 picks/answers）', () => {
   const i = IDX.indexOf("name: 'hand_submit'")

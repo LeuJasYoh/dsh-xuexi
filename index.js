@@ -493,6 +493,11 @@ function applyInner(ctx, config = {}) {
       const work = await getWork()
       const r = await SEE.readAreas(work, { full })
       const areas = r.areas ?? []
+      // ★ marks / layout 必须透传出去 —— 曾经漏了这两行，
+      //   工具算出来了却到不了模型手里，提示词里那句「eye_see 的 marks 会报给你」就是空的。
+      const marks = r.marks ?? []
+      const markDone = marks.filter((m) => m.done === true).length
+      const markUndone = marks.filter((m) => m.done === false).length
       return {
         ok: true,
         url: r.url, title: r.title,
@@ -504,10 +509,18 @@ function applyInner(ctx, config = {}) {
           button: areas.filter((a) => a.kind === 'button').length,
           media: areas.filter((a) => a.kind === 'media').length,
         },
+        marks,
+        marksSummary: marks.length ? { total: marks.length, done: markDone, undone: markUndone } : null,
+        layout: r.layout ?? null,
         // 对账清单：交之前要复核的那几处（只有 pick），原样发给复核员
         ledger: GATE.buildLedger(areas),
         hint: areas.length
           ? '一处一处处理。挑的用 hand_pick，写的用 hand_write，媒体用 hand_play。'
+            + (marks.length
+              ? `\n这一页有 ${marks.length} 个完成标记（已完成 ${markDone} / 未完成 ${markUndone}）——`
+                + '`areas[].done` 已经帮你配好对了。'
+                + '⚠️ 标记是**页面加载时**渲染的，没刷新就是旧值，别拿它当"没算上"的证据。'
+              : '')
           : '这一页没看到要处理的地方 —— 要么类型不对（用 eye_list 看看有什么能点的），要么已经做完了。',
       }
     },
@@ -567,10 +580,56 @@ function applyInner(ctx, config = {}) {
         }
       }
       const work = await getWork()
-      const r = await takeShot(ctx, work, { full, label, clip })
       const url = await work.eval('location.href').catch(() => null)
       const frameRects = await work.frameRects?.().catch?.(() => []) ?? []
       const scrollY = await work.eval('window.scrollY').catch(() => null)
+
+      // ★ 整页截图**分段** —— 实测教训：一张 2.06 MB 的整页图，模型原话
+      //   「the preview is cropped」，截了等于没截，还白烧上下文。
+      //   现在按 1800px 一段切成最多 4 张，每张都清楚，并告诉模型每段覆盖哪一段。
+      if (full && !clip) {
+        const m = await work.send('Page.getLayoutMetrics', {}).catch(() => null)
+        const cs = m?.cssContentSize ?? m?.contentSize ?? null
+        const W = Math.max(1, Math.round(cs?.width ?? 0))
+        const H = Math.max(1, Math.round(cs?.height ?? 0))
+        const SEG = 1800
+        if (H > SEG) {
+          const segs = []
+          for (let i = 0; i < 4 && i * SEG < H; i++) {
+            segs.push({ x: 0, y: i * SEG, width: W, height: Math.min(SEG, H - i * SEG) })
+          }
+          const shots = []
+          for (const [i, c] of segs.entries()) {
+            // eslint-disable-next-line no-await-in-loop
+            const s = await takeShot(ctx, work, { clip: c, label: `${label}-seg${i + 1}` })
+            shots.push({ ...s, from: c.y, to: c.y + c.height })
+          }
+          const images = shots.map((s) => s.image).filter(Boolean)
+          const out = {
+            ok: true,
+            segmented: true,
+            totalHeight: H,
+            segments: shots.map((s, i) => ({
+              i: i + 1, from: s.from, to: s.to, bytes: s.bytes, imageAttached: Boolean(s.image),
+            })),
+            file: shots[0]?.file ?? null,
+            type: shots[0]?.type ?? null,
+            imageAttached: images.length > 0,
+            shotId: B.rememberShot?.({ targetId: work.targetId, url, scrollY, frameRects, at: Date.now() }) ?? null,
+            frameRects,
+            url,
+            note: `整页有 ${H}px 高，已切成 ${shots.length} 段发给你（每段 ${SEG}px）。`
+              + '按 segments 里的 from/to 对着看 —— 这样每段都清楚，不会糊成一片。',
+          }
+          if (!images.length) {
+            out.hint = '分段图没能作为图片送回来。用 read_image 读 file 路径；再不行用手记下来交给用户。'
+          }
+          if (images.length) out.__images = images
+          return out
+        }
+      }
+
+      const r = await takeShot(ctx, work, { full, label, clip })
       const shotId = B.rememberShot?.({ targetId: work.targetId, url, scrollY, frameRects, at: Date.now() }) ?? null
 
       const out = {
@@ -747,21 +806,27 @@ function applyInner(ctx, config = {}) {
 
   reg({
     name: 'hand_scroll',
-    description: '滚动页面。翻长文档、找下面的东西时用。',
+    description:
+      '滚动。翻长文档、找下面的东西时用。\n'
+      + '★ 页面常常有好几个区域（侧栏、正文…），默认滚的那一个**不一定是你想滚的那个**。\n'
+      + '要滚指定区域，把那一处的定位给 `area`，或把窗口名给 `frame`。\n'
+      + '返回里会告诉你**实际滚的是哪个容器**；滚不动也会明说，不会沉默。',
     parameters: {
       type: 'object',
       properties: {
         to: { type: 'string', enum: ['down', 'up', 'bottom', 'top'], description: '默认 down' },
         px: { type: 'number', description: '每次滚多少像素，默认 800' },
         times: { type: 'number', description: '重复几次，默认 1' },
+        area: { ...LOCATOR_SCHEMA, description: '滚「这个东西所在的区域」—— 找它最近的可滚动祖先；没有再滚它所在窗口' },
+        frame: { type: 'string', description: '滚哪个窗口的文档（窗口名从 eye_see / eye_list 的 frame 里取）' },
       },
       additionalProperties: false,
     },
     isConcurrencySafe: () => false,
     serial: true,
-    async run({ to, px, times }) {
+    async run({ to, px, times, area, frame }) {
       const work = await getWork()
-      const r = await HAND.scrollPage(work, { to, px, times })
+      const r = await HAND.scrollPage(work, { to, px, times, area, frame })
       return { ok: true, ...r, changed: `滚到了 ${r?.viewportY ?? '?'} / 共 ${r?.maxY ?? '?'}` }
     },
   })
@@ -836,29 +901,65 @@ function applyInner(ctx, config = {}) {
     name: 'hand_play',
     description:
       '让这一页上的媒体（视频 / 音频）**真播到底**。\n'
-      + '铁律由代码守：原速 1x、永不拖进度条、永不伪造心跳。参数里**故意没有**倍速、跳转、心跳 —— 想都别想。',
+      + '★ **等待时长不用你填** —— 工具自己按视频长度算。\n'
+      + '正常播就一直守着（播完才返回）；**一出事立刻返回**并告诉你原因'
+      + '（被暂停 / 卡住 / 被拖 / 报错 / 要人动手）。\n'
+      + '★ 播完之后会读一次这个媒体的**任务点标记**并如实报给你（`markBefore` / `markAfter`）——'
+      + '正常情况播完就算完成，标记变了就是收工。标记没变才需要再看一眼。\n'
+      + '★ 倍速：默认 1x；**别人改了不纠**，只如实报告。用户明确要求倍速时才传 `rate`。\n'
+      + '参数里**故意没有跳转、没有心跳** —— 想都别想。',
     parameters: {
       type: 'object',
-      properties: { maxMinutes: { type: 'number', description: '最多守多久，默认 12 分钟' } },
+      properties: {
+        maxSeconds: { type: 'number', description: '★ 一般不用填。绝对保险丝（秒）；不给就按视频长度自动算' },
+        stallSeconds: { type: 'number', description: '多久没进展算卡住，默认 25 秒' },
+        rate: { type: 'number', description: '★ 只有「用户明确要求倍速」时才传（如 2）。传了才会把速度钉在这个值上' },
+      },
       additionalProperties: false,
     },
     isConcurrencySafe: () => false,
     serial: true,
-    async run({ maxMinutes }) {
+    async run({ maxSeconds, stallSeconds, rate }) {
       const work = await getWork()
-      const r = await HAND.playMedia(work, { maxMinutes })
+      const r = await HAND.playMedia(work, { maxSeconds, stallSeconds, rate })
       const url = await work.eval('location.href').catch(() => null)
       if (r?.finished) NT.markDone(url, 'media')
-      return {
-        ok: true,
-        ...r,
-        changed: r?.finished
-          ? `播完了（${Math.round(r?.playedSeconds ?? 0)} 秒）`
-          : `没播完：${r?.reason ?? '未知'}`,
-        hint: r?.finished
-          ? '播完了。**再 eye_see 看一眼确认那个标记变了** —— 不要凭感觉。'
-          : '被中断了。处理掉挡路的东西（弹窗之类）再 hand_play 一次；如果是要人动手，记 hand_note 交给用户。',
+
+      // ★ 播完之后**读一次任务点标记，如实报出来** —— 但必须带上"它可能过时"这个前提。
+      //
+      //   实测机制（只读探测坐实的）：任务点标记是**页面加载时**由服务端渲染的。
+      //   播完不刷新页面 → 标记还是上一次加载时的旧值。
+      //   所以看到「任务点未完成」**不代表没算上**，只代表"页面没刷新"。
+      //
+      //   曾经把一次会话里「3 个视频 ended 而标记未变」当成普遍规律，用户指出是误诊；
+      //   后来探测证明：那 3 个视频是在页面最后一次刷新之后播的，标记自然还是旧的。
+      const mark = r?.markAfter ?? null
+      let changed = r?.finished
+        ? `播完了（${Math.round(r?.playedSeconds ?? 0)} 秒 / 共 ${Math.round(r?.durationSeconds ?? 0)} 秒）`
+        : `没播完：${r?.reason ?? '未知'}`
+      if (r?.reason === 'FINISHED' && mark && /已完成/.test(mark) && !/未完成/.test(mark)) {
+        changed += `，页面上标记已是「${mark}」`
       }
+
+      let hint
+      if (r?.reason === 'FINISHED') {
+        if (mark && /已完成/.test(mark) && !/未完成/.test(mark)) {
+          hint = '播完就算完成 —— 页面上标记也对上了。继续下一条。'
+        } else {
+          hint = '**播完就算完成** —— 正常情况不用再确认，继续下一条。\n'
+            + '（页面上那句标记是**页面加载时**渲染的，没刷新就还是旧值，'
+            + '看到「未完成」不代表没算上。真想核实就刷新一次再看。）'
+        }
+      } else {
+        hint = '被中断了。按 reason 处理：被暂停/卡住 → 处理掉挡路的东西再 hand_play 一次；'
+          + '要人动手的话记 hand_note 交给用户。'
+      }
+      if (Array.isArray(r?.rateEvents) && r.rateEvents.length) {
+        hint += `\n（播放速度被改过 ${r.rateEvents.length} 次，现在 ${r.rateNow}x。`
+          + '如果是用户手动改的，不用管；不是你要求的、又反复被改，就如实告诉用户。）'
+      }
+
+      return { ok: true, ...r, changed, hint }
     },
   })
 
