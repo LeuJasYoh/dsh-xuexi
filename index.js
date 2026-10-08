@@ -338,8 +338,52 @@ export function apply(ctx, config = {}) {
       return {
         ok: true, port, loggedIn,
         url: await work.eval('location.href').catch(() => null),
+        // ★ 把「以前学到的」带回来 —— 这就是学习
+        notes: ST.noteDigest(10),
         next: loggedIn ? '已登录 → cx_courses 列课程' : '请在浏览器窗口用学习通 App 扫码，登录后再调一次 cx_open',
       }
+    },
+  })
+
+  reg({
+    name: 'cx_note',
+    description:
+      '**你自己的笔记本。** 干活中发现规律、或遇到要交给用户的事，就写下来；下次开机 cx_open 会带回来。\n' +
+      '\n' +
+      'tag：\n' +
+      '  lesson   学到的东西（站点规律、工作心得）—— 比如「独立作业页连选项都会被字体混淆」\n' +
+      '  pending  需要用户处理的（听力题、看视频才能做的题、讨论帖、看不懂的模块）\n' +
+      '  skip     主动跳过的（要让用户知道理由）\n' +
+      '  general  其它\n' +
+      '\n' +
+      '用法：\n' +
+      '  { add: "…", tag: "lesson" }   写一条\n' +
+      '  { read: true }               看全部（按 tag 分组）\n' +
+      '  { clear: "pending" }          清空某一类（用户处理完了）\n' +
+      '\n' +
+      '⚠️ 判断「该不该做」是你的事，工具不替你判断；记下来是**你的**结论。',
+    parameters: {
+      type: 'object',
+      properties: {
+        add: { type: 'string', description: '要记下的一条' },
+        tag: { type: 'string', enum: ['lesson', 'pending', 'skip', 'general'], description: '分类，默认 general' },
+        read: { type: 'boolean', description: 'true = 读出全部笔记' },
+        clear: { type: 'string', enum: ['lesson', 'pending', 'skip', 'general', 'all'], description: '清空某一类（或 all 清空全部）' },
+      },
+      additionalProperties: false,
+    },
+    isConcurrencySafe: () => true,
+    async execute({ add, tag, read, clear } = {}) {
+      if (add) {
+        const r = ST.addNote(tag, add)
+        return { ok: true, ...r, hint: '已记下。**继续干别的，别停下来找用户。**' }
+      }
+      if (clear) {
+        const r = ST.clearNotes(clear === 'all' ? null : clear)
+        return { ok: true, ...r }
+      }
+      // 默认读
+      return { ok: true, ...ST.noteDigest(50), all: ST.loadNotes() }
     },
   })
 
@@ -651,27 +695,32 @@ export function apply(ctx, config = {}) {
   reg({
     name: 'cx_progress',
     description:
-      '读取本地进度 + **攒下来的「需要用户处理」清单**。\n' +
-      '★ 一轮刷完（或用户要求做完）后调它，把 pendingHuman / pendingHumanText 一次性汇报给用户 —— ' +
-      '**不要一遇到就打断用户**。\n' +
-      '汇报后再调 cx_progress({ clearPending: true }) 把清单清空（前提是用户已经看到/处理了）。',
-    parameters: {
-      type: 'object',
-      properties: {
-        clearPending: { type: 'boolean', description: '汇报完之后清空待办清单，默认 false' },
-      },
-      additionalProperties: false,
-    },
+      '读取本地进度和你的笔记（pending / skip 两类）。\n' +
+      '★ 一轮刷完（或用户要求做完）后调它，把 pending / skip **一次性**汇报给用户 —— ' +
+      '不要一遇到就打断用户。\n' +
+      '用户确认看过之后，用 cx_note({ clear: "pending" }) 清空。',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
     isConcurrencySafe: () => true,
-    async execute({ clearPending = false } = {}) {
+    async execute() {
       const state = ST.loadState()
       const sum = ST.summary(state)
-      if (clearPending && (state.pendingHuman ?? []).length) {
-        state.pendingHuman = []
-        ST.saveState(state)
-        return { ok: true, ...sum, cleared: true, pendingHuman: [], pendingHumanCount: 0, pendingHumanText: '（已清空）' }
+      const notes = ST.loadNotes()
+      const pending = notes.filter((x) => x.tag === 'pending')
+      const skipped = notes.filter((x) => x.tag === 'skip')
+      return {
+        ok: true, ...sum,
+        notesTotal: notes.length,
+        pendingCount: pending.length,
+        skippedCount: skipped.length,
+        pending,
+        skipped,
+        reportText: pending.length || skipped.length
+          ? [
+              pending.length ? `需要你处理（${pending.length} 条）：\n${pending.map((x) => '  · ' + x.text).join('\n')}` : '',
+              skipped.length ? `主动跳过（${skipped.length} 条）：\n${skipped.map((x) => '  · ' + x.text).join('\n')}` : '',
+            ].filter(Boolean).join('\n\n')
+          : '没有需要你处理的条目。',
       }
-      return { ok: true, ...sum, cleared: false }
     },
   })
 
@@ -871,34 +920,35 @@ export function apply(ctx, config = {}) {
   reg({
     name: 'cx_do',
     description:
-      '★ 核心：对 cx_page 报出的**某一个**任务点执行**一个**动作。\n' +
-      '**用 key 指定目标**（推荐，跨页唯一，如 "2:1"）或 t（本页内编号）。\n' +
-      '★ 给 key 时会**自动切到那个页面**再动手 —— 不必先 cx_tab。\n' +
-      'action:\n' +
-      '  play   —— 播放该视频/音频到完成（原速、不拖拽、不伪造心跳），' +
-      '播完会**回读页面自己的记账**确认任务点是否真的翻成已完成（verified）。\n' +
-      '  read   —— 等该测验加载完，返回题目结构，**并直接附上截图路径**（因为 DOM 文字可能全是乱码）。\n' +
-      '  answer —— 给该测验作答并提交（需同时给 answers：题号 → 选项数组）。\n' +
-      '  human  —— ★ **记入「需要用户处理」清单，然后继续，不要停**。' +
-      '用于听力题、看视频才能做的题、讨论帖、搞不定的未知模块。写清 note。\n' +
-      '            （真正要当场打断用户的只有：图形验证码 / 未登录 / 熔断 / 人脸。那些不在这里。）\n' +
-      '  skip   —— 主动跳过，**必须写 note** 说明理由；同样记入清单，收尾时会一并告诉用户。\n' +
-      '做完会重新清点这一页并返回最新状态，便于你决定下一步。',
+      '对某一个任务点执行**一个**明确动作。\n' +
+      '目标用 **key**（推荐，跨页唯一，如 "2:1"）或 t（本页内编号）。\n' +
+      '给 key 时会**自动切到那个页面**再动手 —— 不必先 cx_tab。\n' +
+      '\n' +
+      'action：\n' +
+      '  play   播放该视频/音频到完成（原速、不拖拽、不伪造心跳）。' +
+      '播完会**回读页面自己的记账**，返回 verified 告诉你任务点是不是真的翻成了已完成。\n' +
+      '  read   等测验加载完，返回题目结构，**并附上截图路径**（DOM 文字可能全是乱码，看图）。\n' +
+      '  answer 给测验作答并提交。answers = {"1":["A","B"]}。提交前会校对「浏览器里真的选中了这些」，不一致就拒绝。\n' +
+      '\n' +
+      '⚠️ 这里只有三个动作。**「要不要做」「做不到该怎么办」这类判断不在工具里 —— 归你。**\n' +
+      '   遇到你判断不该做/做不到的（听力题、看视频题、讨论帖、看不懂的模块），\n' +
+      '   用 cx_note({ add, tag:"pending" }) 记下来，继续干别的，最后统一汇报。\n' +
+      '   主动跳过的用 tag:"skip"。\n' +
+      '做完会重新清点这一页并返回最新状态。',
     parameters: {
       type: 'object',
       properties: {
         key: { type: 'string', description: '★ 推荐。cx_page 返回的 key，格式 "页面序号:本页编号"，如 "2:1"' },
         t: { type: 'number', description: '本页内编号（只在当前页有效；给了 key 就忽略它）' },
-        action: { type: 'string', enum: ['play', 'read', 'answer', 'human', 'skip'] },
+        action: { type: 'string', enum: ['play', 'read', 'answer'] },
         answers: { type: 'object', description: 'action=answer 时：题号 → 选项数组，如 {"1":["A","B"]}' },
         maxMinutes: { type: 'number', description: 'action=play 的时长上限，默认 12 分钟' },
-        note: { type: 'string', description: 'action=human / skip 的说明' },
       },
       required: ['action'],
       additionalProperties: false,
     },
     isConcurrencySafe: () => false,
-    execute: serial(async ({ key, t, action, answers, maxMinutes, note } = {}) => {
+    execute: serial(async ({ key, t, action, answers, maxMinutes } = {}) => {
       const work = await getWork(ctx)
       if (!(await OBS.isLoggedIn(work))) return { ok: false, error: 'NOT_LOGGED_IN' }
 
@@ -1026,41 +1076,20 @@ export function apply(ctx, config = {}) {
           break
         }
 
-        // ── 交给用户：★ 记下来，**继续干别的**，做完一轮再统一汇报 ─────────
-        case 'human': {
-          const why = note ?? item.boundary ?? item.note ?? '需要用户处理'
-          ST.markHuman(state, course, cardid, {
-            action: 'human',
-            pageKey: item.key,
-            tabTitle: cardid ? before.tab : null,
-            kind: item.kind, title: item.title ?? null, why,
-          })
-          result = {
-            ok: true, status: 'RECORDED_FOR_USER', kind: item.kind, why,
-            hint: '⚠️ **不要停下来找用户。** 已经记进清单了 —— 继续做这一页/这一节剩下的任务点，'
-              + '等一轮刷完（或用户要求做完）后，用 cx_progress 一次性把这些汇报。',
-          }
-          break
-        }
-
-        // ── 主动跳过：同样记入清单，收尾时一并说明 ──────────────────────────
-        case 'skip': {
-          if (!note) return { ok: false, error: 'NOTE_REQUIRED', hint: 'skip 必须写 note 说明理由' }
-          ST.markHuman(state, course, cardid, {
-            action: 'skip',
-            pageKey: item.key,
-            tabTitle: before.tab,
-            kind: item.kind, title: item.title ?? null, why: note,
-          })
-          result = {
-            ok: true, status: 'SKIPPED', kind: item.kind, note,
-            hint: '已记为「主动跳过」，收尾时会一并告诉用户。**继续做别的。**',
-          }
-          break
-        }
-
+        // ── 只有三个动作。判断归大模型，记录走 cx_note ──────────────────────
         default:
-          return { ok: false, error: 'BAD_ACTION', action, allowed: ['play', 'read', 'answer', 'human', 'skip'] }
+          return {
+            ok: false,
+            error: 'BAD_ACTION',
+            action,
+            allowed: ['play', 'read', 'answer'],
+            hint: 'cx_do 只做这三件明确的事。\n'
+              + '如果你判断这个任务点**不该做 / 做不到**（听力题、看视频才能做的题、'
+              + '讨论帖、看不懂的模块），用 cx_note({ add: "…", tag: "pending" }) 记下来，'
+              + '然后继续干别的 —— 别停下来找用户。\n'
+              + '主动跳过的用 tag: "skip"。\n'
+              + '（真正要当场打断用户的只有：图形验证码 / 未登录 / 熔断额度 / 人脸抓拍。）',
+          }
       }
 
       // 做完重新清点这一页，把最新事实交回给大模型
@@ -1076,13 +1105,13 @@ export function apply(ctx, config = {}) {
         pageAfter: {
           tab: after.tab,
           tabIndex: after.tabIndex,
-          items: after.items.map((x) => ({ key: x.key, t: x.t, kind: x.kind, action: x.action })),
+          items: after.items.map((x) => ({ key: x.key, t: x.t, kind: x.kind, loaded: x.loaded })),
           tpTotal: after.tpTotal,
           tpUndone: after.tpUndone,
-          beyondMe: after.beyondMe,
+          pageFacts: after.pageFacts,
         },
-        next: '看 pageAfter.tpUndone：>0 说明这页还有活，用 pageAfter.items 里的 key 继续 cx_do；'
-          + '=0 就用 cx_tab 翻下一页，或 cx_nav 到下一节。',
+        fact: 'tpUndone > 0 说明这一页还有任务点没完成；= 0 说明这一页可以翻篇了。'
+          + '下一步做什么由你判断 —— 继续 cx_do、翻页、还是记下来。',
       }
     }),
   })
