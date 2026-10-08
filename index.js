@@ -37,6 +37,22 @@ import { checkArgs } from './lib/args.mjs'
 
 export const name = 'dsh-xuexi'
 
+/**
+ * ★ 声明「我要注入哪些服务」—— **少这一行，整个插件就加载不了**。
+ *
+ * 实测事故（2.0.0 第一次装机）：漏了这行，DSH 直接报
+ *   `xuexi (dsh-xuexi): cannot get property "tools" without inject`
+ *   → 预设显示「加载失败」，模式整个用不了。
+ *
+ * 规则（查过 DSH 的服务机制）：
+ *   · **属性访问**（`ctx.tools.register(...)`）必须在这里声明，否则拿不到
+ *   · **可选查询**（`ctx.get?.('attachments')`）不用声明，拿不到就返回 undefined
+ *
+ * 所以这里只写 `tools`：其余 attachments / systemPrompt / sessions / agents
+ * 都是用 `ctx.get?.()` 取的，本来就该容忍"拿不到"。
+ */
+export const inject = ['tools']
+
 const DEFAULT_PORT = 9222
 const DEFAULT_PROFILE = join(NT.STATE_DIR, 'browser-profile')
 

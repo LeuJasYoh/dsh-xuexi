@@ -431,9 +431,15 @@ t('E4 package.json 对得上', () => {
   eq(PKG.dsh.id, 'dsh-xuexi')
   eq(PKG.dsh.repo, 'LeuJasYoh/dsh-xuexi')
 })
-t('E5 插件导出 name/apply', () => {
-  ta('E5b', /export\s+function\s+apply/.test(IDX))
-  ta('E5c', /export\s+const\s+name/.test(IDX))
+t('E5 插件导出 name/apply/inject', () => {
+  ta('E5b 有 apply', /export\s+function\s+apply/.test(IDX))
+  ta('E5c 有 name', /export\s+const\s+name/.test(IDX))
+  // ★ 实测事故（2.0.0 第一次装机）：漏了 inject，DSH 报
+  //   `cannot get property "tools" without inject`，预设直接「加载失败」。
+  //   原因：ctx.tools 是**属性访问**，必须声明注入；ctx.get?.() 那种不用。
+  ta('E5d 有 inject 且含 tools',
+    /export\s+const\s+inject\s*=\s*\[[^\]]*['"]tools['"][^\]]*\]/.test(IDX),
+    "缺 export const inject = ['tools'] —— 整个插件会加载失败")
 })
 t('E6 提示词提到全部 15 个工具（模型得知道怎么调）', () => {
   for (const n of TOOLS) ta(`E6b ${n}`, PROMPT.includes(n))
@@ -448,6 +454,49 @@ t('E11 wait_agent 只等一次写进去了', () => ta('E11b', /只等一次/.tes
 t('E12 铁律六条还在', () => {
   for (const k of ['原速', '拖进度条', '伪造心跳', '串行', '破解', '不代填']) ta(`E12b ${k}`, PROMPT.includes(k))
 })
+
+// ═══════════════════════════════════════════════════════════════════════════
+// F 真的装载一次 —— 模拟 DSH 的服务注入
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 为什么必须有这条（实测事故）：`export const inject = ['tools']` 少了，
+// DSH 报 `cannot get property "tools" without inject`，预设「加载失败」。
+// 语法检查、断言、grep 都抓不到这种错 —— 只有**照 DSH 的规矩真装一次**才抓得住。
+//
+// 这里用 Proxy 复刻 DSH 的行为：没声明注入的服务，**属性访问就抛**。
+
+{
+  const mod = await import('../index.js').catch((e) => ({ __err: e }))
+  if (mod.__err) {
+    ta('F1 能 import index.js', false, mod.__err.message)
+  } else {
+    const inject = Array.isArray(mod.inject) ? mod.inject : []
+    const services = {}
+    const registered = []
+    if (inject.includes('tools')) services.tools = { register: (def) => registered.push(def.name) }
+    services.attachments = { saveImage: async () => ({ attachmentId: 'a1', mediaType: 'image/png', bytes: 1 }) }
+
+    const ctx = new Proxy(services, {
+      get(t, k) {
+        if (k === 'get') return (n) => (n in t ? t[n] : undefined)
+        if (k === 'effect') return (fn) => { try { fn() } catch { /* 注册期抛错不该让装载失败 */ } ; return () => {} }
+        if (k === 'logger') return { warn() {} }
+        if (!(k in t)) throw new Error(`cannot get property "${String(k)}" without inject`)
+        return t[k]
+      },
+    })
+
+    try {
+      await mod.apply(ctx, {})
+      ta('F1 装载成功（apply 没抛）', true)
+      ta('F2 注册了 15 个工具', registered.length === 15, `实际 ${registered.length}：${registered.join(',')}`)
+      for (const n of TOOLS) ta(`F3 ${n} 真的注册上了`, registered.includes(n))
+      ta('F4 systemPrompt 段落被登记（提示词能进上下文）', true)
+    } catch (e) {
+      ta('F1 装载成功（apply 没抛）', false, `apply 抛错：${String(e?.message ?? e)}`)
+    }
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 
