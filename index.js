@@ -423,12 +423,35 @@ export function apply(ctx, config = {}) {
 
       const loggedIn = await OBS.isLoggedIn(work)
       const finalUrl = await work.eval('location.href').catch(() => here)
+
+      // ★ 自检信息：这些都是"只在真机上才知道"的事实，塞进返回值里，
+      //   排查时一眼就能看出是哪一层坏了，不用再来回猜。
+      const attachmentsRef = ctx.get('attachments')
+      const allTabs = await listPages(session.browser).catch(() => [])
+      const diag = {
+        // 图片能不能真的送到模型 —— 全靠这个服务（see objOut.render）
+        attachmentsAvailable: !!attachmentsRef?.saveImage,
+        // 这次绑的是哪一个页面、怎么选的
+        boundTab: {
+          targetId: work.targetId,
+          followedUser: !!work.__followedUser,   // true = 跟的是你看的那页
+          reused: !!work.__reusedWorkTab,
+          owns: !!work.__ownsWorkTab,
+        },
+        // 浏览器里现在有几个标签页（看有没有多出来的空白页）
+        tabs: allTabs.map((t) => {
+          const u = t.url || ''
+          return { id: t.targetId.slice(0, 8), blank: u === 'about:blank' || u === '', url: u.slice(0, 80) }
+        }),
+      }
+
       return {
         ok: true, port, loggedIn,
         url: finalUrl,
         followedUserTab: !!work.__followedUser,
         // ★ 把「以前学到的」带回来 —— 这就是学习
         notes: ST.noteDigest(10),
+        diagnostics: diag,
         next: loggedIn
           ? (onChaoxing
             ? `已连上你正在看的这一页（${String(finalUrl).slice(0, 70)}）—— **没有动它**。`

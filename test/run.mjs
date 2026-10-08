@@ -222,5 +222,45 @@ t('每个 cx_* 工具都有 output.render', () => {
   for (const x of tools) assert.equal(typeof x.output?.render, 'function', x.name + ' 缺 output.render')
 })
 
+console.log('\n═══ 五、预设自检（防止引用不存在的插件）═══\n')
+
+const yml = fs.readFileSync(path.join(PLUGIN, 'cordis.patch.yml'), 'utf8')
+
+t('cordis.patch.yml 里每个 @deepseek-ai/* 插件都真实存在', () => {
+  const refs = [...yml.matchAll(/name:\s*'(@deepseek-ai\/[^']+)'/g)].map((m) => m[1])
+  assert.ok(refs.length > 0, '解析不到任何插件引用，YAML 结构可能变了')
+  // 在本机找 DSH 的 app.asar（找不到就跳过这条，不让 CI/别的机器红）
+  const asar = 'C:\\Users\\23500\\AppData\\Local\\Programs\\DeepSeek Harness\\resources\\app.asar'
+  if (!fs.existsSync(asar)) { console.log('       （本机没有 app.asar，跳过存在性检查）'); return }
+  const idx = fs.readFileSync(asar, 'latin1')
+  for (const ref of refs) {
+    const short = ref.replace('@deepseek-ai/', '')
+    assert.ok(
+      idx.includes(`node_modules/@deepseek-ai/${short}/package.json`),
+      `${ref} 在 asar 里找不到 —— 预设会加载失败`,
+    )
+  }
+})
+
+t('预设的 plugins 里带了 tool-fs（否则模型没有 read_image，判题员派不出去）', () => {
+  assert.ok(/dsh-tool-fs/.test(yml), '缺 tool-fs：模型将没有 read/write/read_image')
+})
+
+t('cx_open 只在"不在学习通上"时才导航（否则会冲掉用户翻好的页）', () => {
+  const src = fs.readFileSync(path.join(PLUGIN, 'index.js'), 'utf8')
+  const body = src.slice(src.indexOf("name: 'cx_open'"), src.indexOf("name: 'cx_note'"))
+  assert.ok(/if \(!onChaoxing\)/.test(body), 'cx_open 里应该有 `if (!onChaoxing)` 守卫')
+  assert.ok(!/execute\(\)\s*\{\s*const work[^]*?await work\.goto\(OBS\.HOME_URL/.test(body),
+    'cx_open 不该无条件 goto 首页')
+})
+
+t('cx_open 会报告自检信息（attachmentsAvailable / boundTab / tabs）', () => {
+  const src = fs.readFileSync(path.join(PLUGIN, 'index.js'), 'utf8')
+  const body = src.slice(src.indexOf("name: 'cx_open'"), src.indexOf("name: 'cx_note'"))
+  for (const k of ['attachmentsAvailable', 'boundTab', 'followedUserTab']) {
+    assert.ok(body.includes(k), 'cx_open 的返回里应该有 ' + k)
+  }
+})
+
 console.log(`\n═══ 结果：${pass} 通过 / ${fail} 失败 ═══\n`)
 process.exit(fail ? 1 : 0)

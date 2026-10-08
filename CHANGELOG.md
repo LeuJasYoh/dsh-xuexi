@@ -4,6 +4,176 @@
 
 ---
 
+## [1.2.2] — 2026-10-08
+
+### 新增
+
+- **`test/run.mjs` —— 假 CDP 测试台**（`npm test`，18 项断言）
+
+  这个项目出过好几次「语法过了、能装载、真机一跑就错」的事，
+  所以关键分支必须有能自动跑的验证。测试台伪造一个 `browser` 对象
+  （`sock.send` 按命令名返回预设结果），然后直接调**真实的**
+  `ensureWorkTab` 和**真实的** `output.render`，断言结果。
+
+  覆盖：选页逻辑 / 空白页接管 / 截图把图交给模型 / 工具表面 / 预设引用的插件是否存在。
+
+  > 第 4 组是**跑起来就立刻抓到**问题的：`cx_shot` 的描述还在说
+  > 「DSH 会自动显示图片」—— 而当时根本没有图。
+
+`test/` 不在 `files` 白名单里，不会进安装副本。
+
+---
+
+## [1.2.1] — 2026-10-08
+
+### 修复
+
+- 🔴 **`cx_enter` 三次全坏（`NO_TABS_ON_PAGE`）**
+  实测日志：3 次 `cx_enter` **全部**失败，模型每次都得再补一次
+  `cx_page({all:true})` 才能干活，白费一步。
+  根因：刚导航进小节时 `#prev_tab` 还没渲染出来，而 `readTabs` 在
+  没有标签条的页面上会立刻返回 `null`（那是为了让首页不干等 25 秒）。
+  两件事单独都对，凑一起就坏了。
+  → `cx_enter` 在 `enterSection` 之后先等 `#prev_tab` 出现（15s）再读。
+
+- 🟡 **整页截图可能存不进附件**
+  附件的图片有像素/体积上限，整页 PNG 动辄几 MB，超了 `saveImage` 直接抛，
+  图就没了 —— 等于又变回「只有路径」。
+  → `screenshot` / `screenshotFull` 支持 `quality`；
+    `takeShot` 先试 PNG，被拒就改用 JPEG(78) 重截一次，并标明 `downscaled`。
+
+---
+
+## [1.2.0] — 2026-10-08
+
+### 修复
+
+用户实测发现三个问题，查证后还挖出第四个、也是更严重的一个。
+
+- 🔴 **`cx_shot` 从来没把图给过模型**（最严重）
+  旧实现只返回 `{file: '…png'}`，是纯文本 —— **模型看不到任何图**。
+  所以它只能去读被字体混淆的 DOM 硬猜。日志里它自己写着
+  「题干+选项都被替换字混淆，但可用上下文语义还原（圪盾=矛盾、圧性=属性）」——
+  那就是猜。猜对是运气，不是能力。
+
+  → 查清 DSH 的契约后修正：`ContentBlockMap` 有 `image` 变体，
+    `ImageBlock = { type:'image', attachment: ImageAttachmentRef }`，
+    用 `ctx.attachments.saveImage(...)` 存附件。
+    现在 `cx_shot` / `cx_do({action:"read"})` 的返回里**真的带着图**。
+
+- 🔴 **DSH 看不到用户手动翻好的页面**（用户直接指出）
+  用户自己翻到「马原章节任务点」后叫 DSH 开始，DSH 却认准状态里记的旧标签页
+  （还停在课程页），把**它**导航到章节页 —— 用户翻的那页从未被看见。
+  这跟预设的意图是**相反**的：预设是「用户把页面递过来」，不是「模型抢一个自己的页面」。
+
+  三个根因叠加：
+  a. `ensureWorkTab` 第 ① 步无条件复用记录的 `targetId`
+  b. `attachToPage` 兜底取 `pages[0]`（浏览器里最早的那个）
+  c. `cx_open` 无条件 `goto(首页)`，把用户翻好的页冲掉
+
+  → 新增 `preferForeground`：探测 `document.visibilityState`，
+    绑定到用户正在看的那个学习通标签页；`cx_open` 只在不在学习通上时才导航。
+    干活中途不重绑 —— 免得把正在播的视频切走。
+
+- 🟡 **浏览器里多出一个空白标签页**（用户指出）
+  浏览器启动自带的空白页没人管，`ensureWorkTab` 又开了第二个。
+  → 第 ③ 步先找闲置空白页接管，没有再新建。
+
+- 🔴 **没有调用子智能体做题**（用户指出）
+  查证：这个环境**根本没有 `subagent` 工具** —— Agent Teams 层显式禁用了
+  `tool-subagent` / `tool-subagent-fork`，换成 `spawn_teammate` / `send_message` / `wait_agent`。
+
+  更糟的是：预设的 `plugins` 列表就是**作用域白名单**，只写了 `[persona, chaoxing]`，
+  所以模型拿到的 30 个工具里**没有 `read` / `write` / `read_image`** ——
+  提示词里写的「判题员用 `read_image` 读图」根本无从执行。
+
+  → `cordis.patch.yml` 加上 `@deepseek-ai/dsh-tool-fs`（read / write / edit / **read_image**），
+    只在本预设作用域生效
+  → 提示词改写为 `spawn_teammate` + `send_message` + `wait_agent`，
+    并新增「你看不到图的时候」一节
+
+### 新增
+
+- `cx_open` 返回 `diagnostics`（`attachmentsAvailable` / `boundTab` / `tabs`）——
+  这些都是「只在真机上才知道」的事实，排查时一眼看出哪一层坏了。
+
+---
+
+## [1.1.1] — 2026-10-08
+
+### 变更
+
+- `package.json` 的 `files` 白名单去掉 `docs/` —— 那是给人看的参考资料，
+  不该进安装副本。安装后只含 `index.js` / `cordis.patch.yml` / `lib` / `prompts`。
+- 清掉 `cx_dom` 描述里对已删除动作 `action:"unknown"` 的过时引用。
+
+---
+
+## [1.1.0] — 2026-10-08
+
+### 变更
+
+**判断权交还给大模型。** 用户指出三个问题，都成立：
+
+- **工具还在替 Agent 判断**
+  `inventory` 给每个 item 打 `action:'play'/'answer'/'human'`、`needsHearing:true`、
+  `boundary:"你没有听觉能力，不要猜…"`、`beyondMe:"…用 human 交给用户"`。
+  Agent 照着 `action` 派活，根本没想 —— 这跟「大模型是大脑」是矛盾的。
+  → 全部删掉，只报事实（有什么东西、什么状态、这一页的环境）。
+  「这一页有音频 + 一道填空题」是事实；「所以这是听力题、我做不到」是 Agent 的判断。
+
+- **完全没有学习的可能**
+  Agent 自己发现的规律（「马原独立作业页连选项都乱码」）无处可写，会话一结束就没了。
+  → 新增 **`cx_note`** —— Agent 自己的笔记本（`lesson` / `pending` / `skip` / `general`）。
+    `cx_open` 开机把摘要带回来 —— 这就是学习。
+
+- **提示词是「说明书」不是「培养」**
+  13540 字全是菜谱（第 1 步/第 2 步、遇到 X 就 Y）。给了步骤，它就只会照抄步骤。
+  → 重写成「领域认知 + 硬约束 + 工作原则」，**4231 字**（后因补充判题员一节增至 5000 字）。
+
+### 工具变更（10 → 15）
+
+- 新增 `cx_note`（笔记本）
+- `cx_do` 收敛为 `play` / `read` / `answer` 三个**页面动作**；
+  `human` / `skip` 移进 `cx_note` —— 那是工作流记录，不是页面操作
+- `cx_progress` 改为读笔记（`pending` / `skip`）并生成汇报文本
+- `cx_open` 返回 `notes` 摘要
+
+铁律（原速 / 不拖拽 / 不伪造心跳 / 不破解验证码 / 人脸拒绝）仍由 `cx_do` 代码强制。
+
+---
+
+## [1.0.2] — 2026-10-08
+
+### 修复
+
+第二次真机测试的现象是「Agent 一直翻页什么都不干，用户以为卡死」。
+根因是 `cx_chapters` 读不到课程，导致它拿不到章节全貌，只能一节一节翻。
+
+- 🔴 **`cx_chapters` / `cx_enter` 读到空课程列表**
+  课程列表在跨域 iframe 里，`goto` 之后要等约 3.5 秒才渲染完。
+  `cx_courses` 等了（`waitForCourseListStable`）所以能列出 25 门课；
+  这两个工具没等，于是每次拿到空数组，报 `COURSE_NOT_FOUND` 且 `available=[]`（日志里连续 6 次）。
+  → 抽出统一的 `resolveCourse()`：goto + 等渲染 + 读 + 模糊匹配标题。
+
+- 🔴 **`readTabs` 在没有标签条的页面上硬等 25 秒 + 固定 sleep 5 秒**
+  它被 `cx_page` 无条件调用，而首页/章节页/作业页根本没有 `#prev_tab` ——
+  于是每调一次白烧 30 秒。实测「`cx_page` 稳定 25 秒」就是这个。
+  → 先判断有没有标签条，没有立刻返回 `null`；有则轮询到数量稳定。
+  → 同步修好 5 个调用点的 `null` 处理（`cx_enter` / `cx_tab` 会直接崩）。
+
+- 🟡 **`cx_enter` 不给 `section` 时报 `SECTION_NOT_FOUND`**
+  但它其实成功读到了 59 个小节 —— 那不是错误，是「还没说进哪个」。
+  → 改成 `ok:true` + `needSection:true` 返回清单。
+
+- 🟡 **`cx_page({all:true})` 不在小节页时报干巴巴的 `NO_TABS`**
+  → 现在先报 `pageKind`，并明确说「你不在小节页上」。
+
+- 提示词新增「不要一节一节往下翻」——
+  那门课有 59 个小节，逐节翻光发现没活干就要二十分钟，用户看不到进展只会以为死机。
+
+---
+
 ## [1.0.1] — 2026-10-07
 
 ### 修复
