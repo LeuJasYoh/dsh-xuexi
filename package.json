@@ -1,6 +1,6 @@
 {
   "name": "dsh-chaoxing",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "DSH 学习通模式：让大模型当司令、脚本当手，在学习通里按真实学习的方式完成课程任务点（原速 / 不拖拽 / 不伪造心跳）",
   "type": "module",
   "license": "MIT",
@@ -14,8 +14,7 @@
     "index.js",
     "cordis.patch.yml",
     "prompts",
-    "lib",
-    "docs"
+    "lib"
   ],
   "keywords": [
     "dsh",
@@ -41,7 +40,7 @@
   "dsh": {
     "id": "dsh-chaoxing",
     "name": "学习通模式",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "repo": "LeuJasYoh/dsh-chaoxing",
     "engines": {
       "dsh": ">=0.2.0"
