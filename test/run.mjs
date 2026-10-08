@@ -262,5 +262,51 @@ t('cx_open 会报告自检信息（attachmentsAvailable / boundTab / tabs）', (
   }
 })
 
+console.log('\n═══ 六、判题覆盖检查（防「漏答」）═══\n')
+
+const CHK = await import('file:///' + path.join(PLUGIN, 'lib', 'check.mjs').replace(/\\/g, '/'))
+
+t('★ 真机失败案例：5 题库只给 4 个答案 → 拦下，并指出漏的是第 5 题', () => {
+  const bad = { 1: ['B'], 2: ['A'], 3: ['A', 'B', 'C'], 4: ['B'] }
+  const cov = CHK.checkAnswerCoverage(5, bad)
+  assert.equal(cov.ok, false, '不该放行')
+  assert.deepEqual(cov.missing, [5], '应该指出漏的是第 5 题')
+  assert.ok(/没有提交/.test(CHK.describeAnswerGap(cov)), '提示要说清「没有提交」')
+})
+
+t('答全了就放行', () => {
+  const cov = CHK.checkAnswerCoverage(5, { 1: ['A'], 2: ['B'], 3: ['C'], 4: ['A'], 5: ['B'] })
+  assert.equal(cov.ok, true)
+  assert.equal(CHK.describeAnswerGap(cov), null)
+})
+
+t('给了题号但选项是空数组 → 也算漏答', () => {
+  const cov = CHK.checkAnswerCoverage(3, { 1: ['A'], 2: ['B'], 3: [] })
+  assert.equal(cov.ok, false)
+  assert.deepEqual(cov.empty, [3])
+})
+
+t('题号超出题量（数错了）→ 拦下', () => {
+  const cov = CHK.checkAnswerCoverage(5, { 1: ['A'], 2: ['B'], 3: ['C'], 4: ['A'], 5: ['B'], 6: ['D'] })
+  assert.equal(cov.ok, false)
+  assert.deepEqual(cov.extra, [6])
+})
+
+t('题量读不到（0）时不误拦 —— 那是我们读不出来，不是模型漏答', () => {
+  const cov = CHK.checkAnswerCoverage(0, { 1: ['A'] })
+  assert.equal(cov.ok, true, 'total=0 时不该拦，否则会卡死')
+})
+
+t('cx_do answer 真的接上了覆盖检查', () => {
+  const src = fs.readFileSync(path.join(PLUGIN, 'index.js'), 'utf8')
+  assert.ok(/CHK\.checkAnswerCoverage\(/.test(src), 'index.js 里没调用 checkAnswerCoverage')
+  assert.ok(/ANSWERS_INCOMPLETE/.test(src), '没返回 ANSWERS_INCOMPLETE')
+})
+
+t('cx_do answer 提交后会报告分数差距（没满分时）', () => {
+  const src = fs.readFileSync(path.join(PLUGIN, 'index.js'), 'utf8')
+  assert.ok(/scoreGap/.test(src), '没给没满分的提示')
+})
+
 console.log(`\n═══ 结果：${pass} 通过 / ${fail} 失败 ═══\n`)
 process.exit(fail ? 1 : 0)

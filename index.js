@@ -32,6 +32,7 @@ import { launchBrowser, ensureWorkTab, listPages } from './lib/browser.mjs'
 import * as OBS from './lib/observe.mjs'
 import * as ACT from './lib/act.mjs'
 import { inventory, inventoryAll } from './lib/inventory.mjs'
+import * as CHK from './lib/check.mjs'
 import * as ST from './lib/state.mjs'
 
 export const name = 'dsh-chaoxing'
@@ -1065,7 +1066,10 @@ export function apply(ctx, config = {}) {
       '  play   播放该视频/音频到完成（原速、不拖拽、不伪造心跳）。' +
       '播完会**回读页面自己的记账**，返回 verified 告诉你任务点是不是真的翻成了已完成。\n' +
       '  read   等测验加载完，返回题目结构，**并附上截图路径**（DOM 文字可能全是乱码，看图）。\n' +
-      '  answer 给测验作答并提交。answers = {"1":["A","B"]}。提交前会校对「浏览器里真的选中了这些」，不一致就拒绝。\n' +
+      '  answer 给测验作答并提交。answers = {"1":["A"],"2":["B","C"]}。\n' +
+      '         ★ **必须覆盖每一题**：工具会先数这套题有几道，缺任何一题就退回不提交\n' +
+      '           （实测教训：5 道题只给了 4 个答案 → 40 分）。\n' +
+      '         提交前还会校对「浏览器里真的选中了这些」，不一致也拒绝。\n' +
       '\n' +
       '⚠️ 这里只有三个动作。**「要不要做」「做不到该怎么办」这类判断不在工具里 —— 归你。**\n' +
       '   遇到你判断不该做/做不到的（听力题、看视频题、讨论帖、看不懂的模块），\n' +
@@ -1188,11 +1192,36 @@ export function apply(ctx, config = {}) {
           if (item.submitted) { result = { ok: true, status: 'ALREADY_GRADED', score: item.score }; break }
 
           await OBS.waitForQuizLoaded(work, { timeoutMs: 40_000 })
-          const applied = await ACT.answerQuiz(work, { answers: answers ?? {} })
+          const before = await OBS.readQuizContent(work)
+
+          // ★★ 覆盖检查：**每一题都必须有答案**。
+          //
+          //   实测（2026-10-08）：一次「题量 5」的测验，模型只给了 4 个答案
+          //   （漏了判断题第 5 题），直接提交 → 40/100。
+          //   这是**机械可查**的疏忽，不该让它过去。
+          //
+          //   逻辑抽在 lib/check.mjs 里 —— 那是纯函数，有单元测试兜着。
+          const total = before.questionCount ?? before.questions?.length ?? 0
+          const ansKeys = answers ?? {}
+          const cov = CHK.checkAnswerCoverage(total, ansKeys)
+          if (!cov.ok) {
+            return {
+              ok: false,
+              error: 'ANSWERS_INCOMPLETE',
+              total: cov.total,
+              missing: cov.missing,
+              empty: cov.empty,
+              extra: cov.extra,
+              whichQuestions: cov.detail,
+              hint: CHK.describeAnswerGap(cov),
+            }
+          }
+
+          const applied = await ACT.answerQuiz(work, { answers: ansKeys })
           await new Promise((r) => setTimeout(r, 800))
           const after = await OBS.readQuizContent(work)
 
-          const verify = Object.entries(answers ?? {}).map(([k, want]) => {
+          const verify = Object.entries(ansKeys).map(([k, want]) => {
             const qq = after.questions?.[Number(k) - 1]
             const got = (qq?.options ?? []).filter((o) => o.chosen).map((o) => o.letter)
             return { q: k, want, got, ok: want.every((x) => got.includes(x)) && got.length === want.length }
@@ -1208,12 +1237,25 @@ export function apply(ctx, config = {}) {
           await ACT.submitQuiz(work)
           await new Promise((r) => setTimeout(r, 2500))
           const fin = await OBS.readQuizContent(work)
+          const fullScore = fin.fullScore ?? 100
+          const lostPoints = fin.submitted && typeof fin.score === 'number' && fin.score < fullScore
           result = {
             ok: !!fin.submitted,
             status: fin.submitted ? 'SUBMITTED' : 'SUBMIT_NOT_CONFIRMED',
             score: fin.score, fullScore: fin.fullScore, attempts: fin.attempts,
             applied, verify,
             hint: fin.submitted ? null : '提交后没读到成绩，可能确认框没点上。重试一次；仍失败就截图问用户。',
+            // ★ 没拿满分：这一页现在是**批阅回顾视图**，上面标着哪题错了。
+            //   让模型看一眼、把错的知识点记进 cx_note —— 这就是"从错里学"。
+            ...(lostPoints ? {
+              scoreGap: {
+                lost: fullScore - fin.score,
+                hint: `没拿满分（${fin.score}/${fullScore}）。这一页现在是**批阅回顾**，`
+                  + '上面能看出是哪几题错了。**看一眼**：如果是个知识点上的错（不是粗心），'
+                  + '用 cx_note({ add: "…", tag: "lesson" }) 记下来，同类题下次别再错。'
+                  + '（学习通一般不允许重做，不要尝试重复提交。）',
+              },
+            } : {}),
           }
           if (fin.submitted) record({ note: `自动作答 ${fin.score}/${fin.fullScore}` })
           break
