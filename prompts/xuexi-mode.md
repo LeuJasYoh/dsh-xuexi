@@ -83,16 +83,19 @@
 
 | 工具 | 干什么 | 怎么写 |
 |---|---|---|
-| `hand_click` | 点一下 | `hand_click({ i: "h4xt52c:3" })` |
-| `hand_pick` | 在可挑区里挑 | `hand_pick({ area:"r3", choose:["o1","o2"], mode:"set" })` |
-| `hand_write` | 在可写区写字 | `hand_write({ area:"r7", text:"…", mode:"replace" })` |
+| `hand_click` | 点一下 | `hand_click({ i: "<eye_see 给的编号>" })` |
+| `hand_pick` | 在可挑区里挑 | `hand_pick({ area:"<区编号>", choose:["<选项编号>"], mode:"set" })` |
+| `hand_write` | 在可写区写字 | `hand_write({ area:"<区编号>", text:"…", mode:"replace" })` |
 | `hand_scroll` | 滚 | `hand_scroll({ to:"down" })` |
 | `hand_goto` | 跳网址 / 后退 / 刷新 | `hand_goto({ url:"https://example.com/" })` |
 | `hand_tab` | 换浏览器标签页 | `hand_tab({ i: 1 })` |
 | `hand_play` | 让媒体真播到底 | `hand_play({ maxMinutes: 12 })` |
-| `hand_submit` | 把页面上弄好的交上去 | `hand_submit({ confirm:true, reviewed:"tk_…", button:{"i":"b1"} })` |
+| `hand_submit` | 把页面上弄好的交上去 | `hand_submit({ confirm:true, reviewed:"<eye_check 的票据>", button:{"i":"<eye_check 的按钮编号>"} })` |
 | `hand_note` | 记笔记 / 待办 | `hand_note({ add:"…", tag:"lesson" })` |
 | `hand_verdict` | 复核员登记 | `hand_verdict({ picks:{"1":["B"]} })` |
+
+> ★ **编号必须原样照抄工具给的**（形如 `rqgky66:0`、`rqgky66:0o2`）。
+> **别自己编、别按 1 起数** —— 选项编号是从 `o0` 开始的。
 
 ---
 
@@ -101,7 +104,7 @@
 ### 指一个东西，只许三种写法
 
 ```
-{ "i": "h4xt52c:3" }                  ← 工具给的编号（最稳）
+{ "i": "rqgky66:0" }                  ← 工具给的编号（最稳，**原样照抄**）
 { "text": "提交", "frame": "…" }       ← 屏幕上的可见文字
 { "x": 812, "y": 455 }                ← 当前屏幕坐标（兜底，永远可用）
 ```
