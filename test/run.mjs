@@ -597,9 +597,10 @@ t('E2 persona.prefix 必填且不带 complete', () => {
 t('E3 文件工具在白名单里（否则复核员读不了图）', () => ta('E3b', /@deepseek-ai\/dsh-tool-fs/.test(YML)))
 t('E4 package.json 对得上', () => {
   eq(PKG.name, 'dsh-xuexi')
-  eq(PKG.version, '2.0.1')
+  eq(PKG.version, '2.2.0')
   eq(PKG.dsh.id, 'dsh-xuexi')
   eq(PKG.dsh.repo, 'LeuJasYoh/dsh-xuexi')
+  eq(PKG.dsh.name, '网课模式')
 })
 t('E5 插件导出 name/apply/inject', () => {
   ta('E5b 有 apply', /export\s+function\s+apply/.test(IDX))
