@@ -4,14 +4,14 @@
  * 分五组：
  *   A 参数校验（args.mjs）  —— 格式错必须拦住，且**零副作用**
  *   B 复核闸门（gate.mjs）  —— 七条 + 票据 + 登记覆盖
- *   C 工具表面             —— 15 个工具、前缀、并发标志
+ *   C 工具表面             —— 16 个工具、前缀、并发标志
  *   D 痕迹检查             —— 代码/提示词里不许有平台字样
  *   E 预设自检             —— cordis.patch.yml / package.json / 提示词对得上
  *
  * 跑法：npm test
  */
 
-import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs'
+import { readFileSync, readdirSync, existsSync, statSync, rmSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -42,6 +42,7 @@ const eq = (a, b, msg) => { if (a !== b) throw new Error(`${msg ?? ''} 期望 ${
 
 const A = await import('../lib/args.mjs')
 const G = await import('../lib/gate.mjs')
+const NT = await import('../lib/note.mjs')
 
 // ═══════════════════════════════════════════════════════════════════════════
 // A 参数校验
@@ -146,6 +147,65 @@ t('A34 hand_verdict: 空登记 → USAGE', () => eq(A.checkArgs('hand_verdict', 
 t('A35 hand_verdict 正常', () => eq(A.checkArgs('hand_verdict', { picks: { 1: ['B'] } }).ok, true))
 
 t('A36 不认识的工具 → 不拦（内部用）', () => eq(A.checkArgs('nope', {}).ok, true))
+
+// ── A37+：v2.2 新增能力的校验（2x 倍速实测 + 日志诊断的回归）────────────────
+
+t('A37 hand_play: target 可以给（多视频页面必给）', () => {
+  const r = A.checkArgs('hand_play', { target: { i: 'abc:3' } })
+  eq(r.ok, true); eq(r.args.target.i, 'abc:3')
+})
+t('A38 hand_play: 不给 target 也行（单视频页面）', () => {
+  const r = A.checkArgs('hand_play', {})
+  eq(r.ok, true); eq(r.args.target, null)
+})
+t('A39 hand_play: target 混着给多种定位 → ARG', () => eq(A.checkArgs('hand_play', { target: { i: 'a', text: 'b' } }).ok, false))
+
+t('A40 hand_note: replaces 可以带（作废旧经验）', () => {
+  const r = A.checkArgs('hand_note', { add: '纠正：js-play 是有效的', tag: 'lesson', replaces: 'js-play 强制播放' })
+  eq(r.ok, true); eq(r.args.replaces, 'js-play 强制播放')
+})
+t('A41 hand_note: replaces 空串 → ARG', () => eq(A.checkArgs('hand_note', { add: 'x', replaces: '  ' }).ok, false))
+
+t('A42 hand_read: area 必给（area / frame 二选一）', () => {
+  const r = A.checkArgs('hand_read', {})
+  eq(r.ok, false); eq(r.category, 'ARG')
+  ta('A42b 话说明白', /area|frame/.test(r.error + (r.expected ?? '')), r.error)
+})
+t('A43 hand_read: 正常（area + 默认参数）', () => {
+  const r = A.checkArgs('hand_read', { area: { i: 'abc:6' } })
+  eq(r.ok, true)
+  eq(r.args.stepPx, 300)      // ★ 默认小步 —— 文档任务点对节奏敏感，大步快跳不计
+  eq(r.args.dwellMs, 1000)
+  eq(r.args.maxSeconds, 300)
+})
+t('A44 hand_read: stepPx 调太大 → ARG（防偷懒）', () => eq(A.checkArgs('hand_read', { area: { i: 'x' }, stepPx: 5000 }).ok, false))
+t('A45 hand_read: 用 frame 指定窗口也行', () => {
+  const r = A.checkArgs('hand_read', { frame: '子窗口:pan-yz.chaoxing.com/v2/file_x' })
+  eq(r.ok, true); eq(r.args.frame.includes('pan-yz'), true)
+})
+
+// ── A46+：笔记作废机制（实测教训：库里同时躺着「js-play 无效」和「js-play 有效」
+//    两条矛盾经验，下次开工互相打架）──────────────────────────────────────────
+{
+  const os = await import('node:os')
+  const tmp = join(os.tmpdir(), `dsh-note-test-${Date.now()}`)
+  const savedDir = NT.getOutputDir()
+  NT.setOutputDir(tmp)
+  try {
+    NT.addNote('lesson', '学习通视频任务点：hand_play 的 js-play 强制播放不会被记录观看时长')
+    const r = NT.addNote('lesson', '纠正：hand_play js-play 播完是有效的', 'js-play 强制播放')
+    ta('A46 作废了 1 条旧经验', r.outdated === 1, JSON.stringify(r))
+    const all = NT.loadNotes()
+    ta('A47 旧笔记被标记 outdated', all.filter((x) => x.outdated).length === 1)
+    const dig = NT.noteDigest(20)
+    ta('A48 摘要不带回已作废的', dig.total === all.filter((x) => !x.outdated).length, `digest.total=${dig.total} active=${all.filter((x) => !x.outdated).length}`)
+    ta('A49 摘要的 recent 里没有作废条目', dig.recent.every((x) => !x.text.includes('不会被记录观看时长')))
+    ta('A50 摘要提示里有 replaces 用法', /replaces/.test(dig.hint), dig.hint)
+  } finally {
+    NT.setOutputDir(savedDir)
+    try { rmSync(tmp, { recursive: true, force: true }) } catch { /* 删不掉就算了 */ }
+  }
+}
 
 // ── ★ 零副作用：结构保证 ───────────────────────────────────────────────────
 t('A37 args.mjs 是纯的（不 import 任何东西）', () => {
@@ -421,16 +481,16 @@ t('B33 跳到新页面不报确认框（新页的按钮是它自己的）', () =
 const IDX = read('index.js')
 const TOOLS = [...IDX.matchAll(/name:\s*'(eye_[a-z]+|hand_[a-z]+)'/g)].map((m) => m[1])
 
-t('C1 一共 15 个工具', () => eq(TOOLS.length, 15, `实际 ${TOOLS.length}：${TOOLS.join(',')}`))
+t('C1 一共 16 个工具', () => eq(TOOLS.length, 16, `实际 ${TOOLS.length}：${TOOLS.join(',')}`))
 t('C2 眼 5 个', () => {
   const eyes = TOOLS.filter((x) => x.startsWith('eye_'))
   eq(eyes.length, 5, eyes.join(','))
   for (const n of ['eye_open', 'eye_see', 'eye_list', 'eye_shot', 'eye_check']) ta(`C2b ${n}`, eyes.includes(n))
 })
-t('C3 手 10 个', () => {
+t('C3 手 11 个', () => {
   const hands = TOOLS.filter((x) => x.startsWith('hand_'))
-  eq(hands.length, 10, hands.join(','))
-  for (const n of ['hand_click', 'hand_pick', 'hand_write', 'hand_scroll', 'hand_goto', 'hand_tab',
+  eq(hands.length, 11, hands.join(','))
+  for (const n of ['hand_click', 'hand_pick', 'hand_write', 'hand_scroll', 'hand_read', 'hand_goto', 'hand_tab',
     'hand_play', 'hand_submit', 'hand_note', 'hand_verdict']) ta(`C3b ${n}`, hands.includes(n))
 })
 t('C4 不许再有旧前缀', () => ta('C4b', !/\bcx_[a-z]/.test(IDX)))
@@ -441,7 +501,8 @@ t('C5 并发标志：只读的是 true，会动手的是 false', () => {
   for (const b of blocks) {
     const nm = /name:\s*'([a-z_]+)'/.exec(b)?.[1]
     if (!nm) continue
-    const safe = /isConcurrencySafe:\s*\(\)\s*=>\s*true/.test(b.slice(0, 900))
+    // ⚠️ 窗口要足够大 —— 描述写得长的工具（如 hand_play）会把 isConcurrencySafe 推出小窗口
+    const safe = /isConcurrencySafe:\s*\(\)\s*=>\s*true/.test(b.slice(0, 4000))
     if (READONLY.has(nm)) ta(`C5b ${nm} 只读，应为 true`, safe)
     else ta(`C5c ${nm} 会动页面，应为 false`, !safe)
   }
@@ -451,7 +512,7 @@ t('C6 会动手的手都上了串行锁', () => {
   for (const b of blocks) {
     const nm = /name:\s*'([a-z_]+)'/.exec(b)?.[1]
     if (!nm || nm.startsWith('eye_') || nm === 'hand_note' || nm === 'hand_verdict') continue
-    ta(`C6b ${nm} 应有 serial: true`, /serial:\s*true/.test(b.slice(0, 900)))
+    ta(`C6b ${nm} 应有 serial: true`, /serial:\s*true/.test(b.slice(0, 4000)))
   }
 })
 t('C8b eye_see 必须把 marks / layout 透传给模型', () => {
@@ -550,7 +611,7 @@ t('E5 插件导出 name/apply/inject', () => {
     /export\s+const\s+inject\s*=\s*\[[^\]]*['"]tools['"][^\]]*\]/.test(IDX),
     "缺 export const inject = ['tools'] —— 整个插件会加载失败")
 })
-t('E6 提示词提到全部 15 个工具（模型得知道怎么调）', () => {
+t('E6 提示词提到全部 16 个工具（模型得知道怎么调）', () => {
   for (const n of TOOLS) ta(`E6b ${n}`, PROMPT.includes(n))
 })
 t('E7 提示词里有"复核员专用"分流', () => ta('E7b', /复核员专用/.test(PROMPT)))
@@ -634,7 +695,7 @@ t('E12 铁律六条还在', () => {
       await plugin.apply(ctx, {})
       ta('F1 装载成功（apply 没抛）', true)
       const names = registered.map((d) => d.name)
-      ta('F2 注册了 15 个工具', registered.length === 15, `实际 ${registered.length}：${names.join(',')}`)
+      ta('F2 注册了 16 个工具', registered.length === 16, `实际 ${registered.length}：${names.join(',')}`)
       for (const n of TOOLS) ta(`F3 ${n} 真的注册上了`, names.includes(n))
       for (const d of registered) walkSchema(d.parameters, `${d.name}.parameters`)
       ta('F4 参数 schema 都写全了（object 有 properties、array 有 items）', bad.length === 0,

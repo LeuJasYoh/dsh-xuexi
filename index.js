@@ -958,15 +958,18 @@ function applyInner(ctx, config = {}) {
     description:
       '让这一页上的媒体（视频 / 音频）**真播到底**。\n'
       + '★ **等待时长不用你填** —— 工具自己按视频长度算。\n'
+      + '★ **多视频的页面要给 `target`**（通常是那个视频「播放视频」按钮的编号）——'
+      + '不给就会"谁在播挑谁"，一页好几个视频时容易守错（实测出过：你点的是第 7 个，它守的是别的）。\n'
       + '正常播就一直守着（播完才返回）；**一出事立刻返回**并告诉你原因'
       + '（被暂停 / 卡住 / 被拖 / 报错 / 要人动手）。\n'
-      + '★ 播完之后会读一次这个媒体的**任务点标记**并如实报给你（`markBefore` / `markAfter`）——'
-      + '正常情况播完就算完成，标记变了就是收工。标记没变才需要再看一眼。\n'
+      + '★ 返回 `reason:"PAUSED"` 或 `"STALLED"` 时**必须处理后重播** —— 不要自己估算'
+      + '「大概看够了」，比例让页面说了算。\n'
       + '★ 倍速：默认 1x；**别人改了不纠**，只如实报告。用户明确要求倍速时才传 `rate`。\n'
       + '参数里**故意没有跳转、没有心跳** —— 想都别想。',
     parameters: {
       type: 'object',
       properties: {
+        target: { ...LOCATOR_SCHEMA, description: '★ 要播哪一个：给它的「播放视频」按钮（或播放器）的编号/定位。多视频页面必给' },
         maxSeconds: { type: 'number', description: '★ 一般不用填。绝对保险丝（秒）；不给就按视频长度自动算' },
         stallSeconds: { type: 'number', description: '多久没进展算卡住，默认 25 秒' },
         rate: { type: 'number', description: '★ 只有「用户明确要求倍速」时才传（如 2）。传了才会把速度钉在这个值上' },
@@ -975,9 +978,9 @@ function applyInner(ctx, config = {}) {
     },
     isConcurrencySafe: () => false,
     serial: true,
-    async run({ maxSeconds, stallSeconds, rate }) {
+    async run({ target, maxSeconds, stallSeconds, rate }) {
       const work = await getWork()
-      const r = await HAND.playMedia(work, { maxSeconds, stallSeconds, rate })
+      const r = await HAND.playMedia(work, { maxSeconds, stallSeconds, rate, target })
       const url = await work.eval('location.href').catch(() => null)
       if (r?.finished) NT.markDone(url, 'media')
 
@@ -1114,17 +1117,48 @@ function applyInner(ctx, config = {}) {
   })
 
   reg({
+    name: 'hand_read',
+    description:
+      '★ **慢翻一个文档到底** —— 回顶 → 小步往下（默认 300px）→ 每步停一拍（默认 1 秒）→ 到底。\n'
+      + '一次调用顶过去手动滚六七次，而且**绝不偷懒**（不会大步快跳）。\n'
+      + '为什么要有：文档类任务点对**翻阅节奏**敏感 —— 小步慢翻算"读过"，'
+      + '大步快跳（px:1000 / 一步到底）**不计**。实测两批文档全因快翻白翻。\n'
+      + '翻完刷新看一眼那个标记 / 目录数字 —— 没变再说。',
+    parameters: {
+      type: 'object',
+      properties: {
+        area: { ...LOCATOR_SCHEMA, description: '★ 翻哪个：给那一处（通常是阅读器里某个按钮）的编号/定位，用来锁定滚哪个容器' },
+        frame: { type: 'string', description: '翻哪个窗口的文档（窗口名从 eye_see / eye_list 的 frame 里取）' },
+        stepPx: { type: 'number', description: '每步滚多少像素，默认 300（别调大 —— 大步可能不算"读过"）' },
+        dwellMs: { type: 'number', description: '每步停多久（毫秒），默认 1000' },
+        maxSeconds: { type: 'number', description: '最多翻多久（秒），默认 300。没翻完可以再叫一次接着翻' },
+      },
+      additionalProperties: false,
+    },
+    isConcurrencySafe: () => false,
+    serial: true,
+    async run({ area, frame, stepPx, dwellMs, maxSeconds }) {
+      const work = await getWork()
+      const r = await HAND.readThrough(work, { area, frame, stepPx, dwellMs, maxSeconds })
+      return { ok: true, ...r }
+    },
+  })
+
+  reg({
     name: 'hand_note',
     description:
       '★ 你的笔记本，也是给用户的待办清单。三种用法：add（写一条）/ read:true（读全部）/ clear（清某一类）。\n'
       + 'tag：lesson（你摸出来的规律，下次 eye_open 会带回来）/ pending（要交给用户的）/ skip（你主动跳过的）。\n'
+      + '★ **发现自己以前的笔记错了？写新笔记时带上 `replaces`（旧笔记里的一段原文），'
+      + '把旧的那条作废掉** —— 免得两条矛盾的经验下次打架。\n'
       + '⚠️ **笔记里永远不许写答案** —— 只写规律和待办。',
     parameters: {
       type: 'object',
       properties: {
         add: { type: 'string', description: '要记下的一条' },
         tag: { type: 'string', enum: ['lesson', 'pending', 'skip', 'general'], description: '分类，默认 general' },
-        read: { type: 'boolean', description: 'true = 读出全部' },
+        replaces: { type: 'string', description: '要作废的旧笔记里的一段原文（包含匹配）—— 新经验推翻旧经验时用' },
+        read: { type: 'boolean', description: 'true = 读出全部（含已作废的）' },
         clear: { type: 'string', enum: ['lesson', 'pending', 'skip', 'general', 'all'], description: '清空某一类' },
       },
       additionalProperties: false,
@@ -1133,15 +1167,20 @@ function applyInner(ctx, config = {}) {
     async run(args) {
       if (args.read) {
         const notes = NT.loadNotes()
+        const active = notes.filter((x) => !x.outdated)
         return {
-          ok: true, total: notes.length, notes,
+          ok: true, total: active.length, outdatedTotal: notes.length - active.length, notes,
           summary: NT.summary(),
-          remember: '⚠️ 笔记是经验不是事实 —— 页面可能变了，先看一眼再信它。',
+          remember: '⚠️ 笔记是经验不是事实 —— 页面可能变了，先看一眼再信它。'
+            + '标 outdated:true 的是已作废的旧经验，别照它做。',
         }
       }
       if (args.clear) return { ok: true, ...NT.clearNotes(args.clear) }
-      const r = NT.addNote(args.tag, args.add)
-      return { ok: true, ...r, summary: NT.summary(), hint: '记下了。继续干活，别停下来找用户。' }
+      const r = NT.addNote(args.tag, args.add, args.replaces)
+      const hint = r.outdated
+        ? `记下了，并把 ${r.outdated} 条旧笔记作废了。继续干活，别停下来找用户。`
+        : '记下了。继续干活，别停下来找用户。'
+      return { ok: true, ...r, summary: NT.summary(), hint }
     },
   })
 
