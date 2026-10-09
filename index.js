@@ -235,7 +235,7 @@ function applyInner(ctx, config = {}) {
   const port = config.port ?? DEFAULT_PORT
 
   /** 这次会话的状态（浏览器句柄 + 复核登记簿） */
-  const session = { browser: null, work: null, verdicts: {}, lastToken: null, busy: false }
+  const session = { browser: null, work: null, verdicts: {}, lastToken: null, busy: false, ignoreByLh: {} }
 
   // ── 过程文件落在哪：<工作区>/.xuexi/ ──────────────────────────────────────
   //
@@ -386,6 +386,36 @@ function applyInner(ctx, config = {}) {
         : '参数没问题，是屏幕上这件事没做成。**别改调用** —— 退回三件万能事：'
           + 'eye_shot 看一眼 → eye_list 列出所有能点的 → hand_click 点一个看页面怎么变。',
     }
+  }
+
+  // ── 软保护的前置一眼：点之前先看清目标像不像"提交" ────────────────────────
+  //
+  // ★ 2.0.1 修复的缺陷：早先的软保护在 clickLocator **返回之后**才检查 ——
+  //   "拦住"两个字说出口时，点击已经发生、答案已经交上去了，还谎报了"没点成"。
+  //   现在先看一眼（只读，零副作用），像"提交"就走 hand_submit；看漏了点完才发现，
+  //   也只如实警告，绝不谎报"拦住了"。
+  const SUBMIT_LIKE = /提交|交卷|上交|确认提交|submit/i
+  async function peekTargetLabel(work, loc) {
+    try {
+      if (!loc || typeof loc !== 'object') return ''
+      if (loc.text) {
+        const hit = await SEE.findElementByLocator(work, { text: loc.text, exact: loc.exact === true, frame: loc.frame })
+        return String(hit?.text ?? loc.text)
+      }
+      if (loc.i) {
+        const hit = await SEE.findElementByLocator(work, { i: loc.i })
+        return String(hit?.text ?? '')
+      }
+      if (Number.isFinite(loc.x) && Number.isFinite(loc.y)) {
+        const t = await work.eval(`(() => {
+          const e = document.elementFromPoint(${Math.round(loc.x)}, ${Math.round(loc.y)});
+          if (!e) return '';
+          return String(e.innerText || e.value || e.getAttribute('title') || e.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 60);
+        })()`).catch(() => '')
+        return String(t ?? '')
+      }
+    } catch { /* 看不清就不拦 —— 拦错比放行更糟 */ }
+    return ''
   }
 
   // ── 统一注册：每个工具都走这一条路 ────────────────────────────────────────
@@ -618,8 +648,18 @@ function applyInner(ctx, config = {}) {
             shotId: B.rememberShot?.({ targetId: work.targetId, url, scrollY, frameRects, at: Date.now() }) ?? null,
             frameRects,
             url,
-            note: `整页有 ${H}px 高，已切成 ${shots.length} 段发给你（每段 ${SEG}px）。`
-              + '按 segments 里的 from/to 对着看 —— 这样每段都清楚，不会糊成一片。',
+            note: (() => {
+              const covered = shots.length ? shots[shots.length - 1].to : 0
+              let s = `整页有 ${H}px 高，已切成 ${shots.length} 段发给你（每段 ${SEG}px）。`
+                + '按 segments 里的 from/to 对着看 —— 这样每段都清楚，不会糊成一片。'
+              // ★ 2.0.1 修复：最多 4 段 = 7200px，更长的页**必须明说没截全**，
+              //   否则模型会把"没截到"当成"不存在"。
+              if (covered < H) {
+                s += `\\n⚠️ 这页太长，只截到了 ${covered}px —— 下面还有 ${H - covered}px 没截到。`
+                  + '用 hand_scroll 往下滚，再 eye_shot 接着看，别把没截到的部分当成"不存在"。'
+              }
+              return s
+            })(),
           }
           if (!images.length) {
             out.hint = '分段图没能作为图片送回来。用 read_image 读 file 路径；再不行用手记下来交给用户。'
@@ -672,8 +712,13 @@ function applyInner(ctx, config = {}) {
       const work = await getWork()
       const r = await SEE.readAreas(work, { full: false })
       const areas = r.areas ?? []
-      const ledger = GATE.buildLedger(areas, ignore)
-      const lh = GATE.ledgerHash(ledger)
+      // ★ 三处共用同一个口径（gate.reviewContext）：题目身份 = 全量清单哈希，
+      //   ignore 只筛"要复核哪几处"，并按身份记进 session —— hand_verdict / hand_submit 取同一份。
+      //   （2.0.1 修复：早先这里带 ignore、另两处不带，哈希对不上 → 用了 ignore 就永远交不了卷。）
+      const rc = GATE.reviewContext(areas, session.ignoreByLh, ignore)
+      session.ignoreByLh = { ...session.ignoreByLh, [rc.lh]: rc.ignore }
+      const ledger = rc.ledger
+      const lh = rc.lh
       const fingerprint = GATE.pageFingerprint({ targetId: work.targetId, url: r.url, areas })
 
       const store = session.verdicts[lh] ?? {}
@@ -742,18 +787,26 @@ function applyInner(ctx, config = {}) {
     serial: true,
     async run({ loc, settleMs }) {
       const work = await getWork()
-      const r = await HAND.clickLocator(work, loc, { settleMs })
-      // ★ 软保护：点到一个"一看就是提交"的按钮、却还没复核过 → 拦住，叫它走 hand_submit
-      const label = String(r?.clicked?.text ?? '')
-      if (/提交|交卷|上交|确认提交|submit/i.test(label) && !session.lastToken) {
+      // ★ 软保护必须在**点击之前**（2.0.1 修复：早先点完才检查，"拦住"说出口时
+      //   答案其实已经交上去了）。先只读地看一眼目标，像"提交"就走 hand_submit。
+      const peek = await peekTargetLabel(work, loc)
+      if (SUBMIT_LIKE.test(peek) && !session.lastToken) {
         return {
           ok: false, category: 'USAGE', error: 'SUBMIT_MUST_GO_THROUGH_HAND_SUBMIT',
           expected: '交答案只能用 hand_submit —— 它会先复核（空着的、越界的、复核员够不够、三份一不一致），过了才点。',
           example: '先 eye_check({}) 拿票据，再 hand_submit({ confirm:true, reviewed:"票据", button:{i:"…"} })',
-          hint: '你点到的是「' + label.slice(0, 40) + '」。交是全站唯一做错回不了头的动作，不能顺手点过去。',
+          hint: '你要点的是「' + peek.slice(0, 40) + '」。交是全站唯一做错回不了头的动作，不能顺手点过去。',
         }
       }
-      return { ok: true, ...r }
+      const r = await HAND.clickLocator(work, loc, { settleMs })
+      const out = { ok: true, ...r }
+      // 看漏了（图标按钮没文字之类）点完才发现像"提交" → 如实警告，绝不谎报"拦住了"
+      const clickedText = String(r?.clicked?.text ?? '')
+      if (SUBMIT_LIKE.test(clickedText) && !SUBMIT_LIKE.test(peek)) {
+        out.warning = '这一下点到了「' + clickedText.slice(0, 40) + '」—— 它看起来像"提交"类按钮，而点击已经发生、拦不住了。'
+          + '如果这就是交答案：先 eye_check 看一眼页面现在的状态，必要时 hand_note 告诉用户；以后交答案走 hand_submit。'
+      }
+      return out
     },
   })
 
@@ -777,6 +830,8 @@ function applyInner(ctx, config = {}) {
     async run({ area, choose, mode }) {
       const work = await getWork()
       const r = await HAND.pickOptions(work, { area, choose, mode })
+      // ★ 页面上的答案变了 → 旧票据作废（rejected = 整批没动过，票据仍然有效）
+      if (!r?.rejected?.length) session.lastToken = null
       return { ok: true, ...r, changed: `这一处现在选中 ${r?.areaState?.selected ?? '?'} / 共 ${r?.areaState?.total ?? '?'} 个选项` }
     },
   })
@@ -800,6 +855,7 @@ function applyInner(ctx, config = {}) {
     async run({ area, text, mode }) {
       const work = await getWork()
       const r = await HAND.writeInto(work, { area, text, mode })
+      session.lastToken = null       // ★ 写过字 → 旧票据作废
       return { ok: true, ...r, changed: `这一处现在的内容是：${String(r?.valueNow ?? '').slice(0, 120)}` }
     },
   })
@@ -986,8 +1042,12 @@ function applyInner(ctx, config = {}) {
       const before = await work.eval('location.href').catch(() => null)
       const r = await SEE.readAreas(work, { full: false })
       const areas = r.areas ?? []
-      const ledger = GATE.buildLedger(areas)
-      const lh = GATE.ledgerHash(ledger)
+      // ★ 和发票据那次同一个口径（gate.reviewContext）：身份 = 全量清单哈希，
+      //   ignore 从 session 取 —— eye_check({ignore}) 存进去的那份。
+      //   （2.0.1 修复：早先这里不带 ignore → 票据永远 STALE_TOKEN、被忽略处又报空。）
+      const rc = GATE.reviewContext(areas, session.ignoreByLh)
+      const ledger = rc.ledger
+      const lh = rc.lh
       const fingerprint = GATE.pageFingerprint({ targetId: work.targetId, url: r.url, areas })
       const entries = Object.entries(session.verdicts[lh] ?? {}).map(([id, v]) => ({ id, ...v }))
 
@@ -1003,7 +1063,7 @@ function applyInner(ctx, config = {}) {
       // ★ 票据只是"你看过一次"；这里**自己再走一遍**七条
       const hit = await SEE.findElementByLocator(work, button).catch(() => ({ found: false }))
       const gate = GATE.checkGate({
-        areas, ledger, entries, submitButton: button,
+        areas, ledger, entries, ignore: rc.ignore, submitButton: button,
         submitFound: Boolean(hit?.found && hit.visible !== false),
       })
       if (!gate.pass) {
@@ -1024,9 +1084,13 @@ function applyInner(ctx, config = {}) {
         + ` return m ? { score: parseFloat(m[1]), full: parseFloat(m[2]) } : null })()`,
       ).catch(() => null)
 
-      const confirmBtn = (after.areas ?? []).find((a) => a.kind === 'button' && !(r.areas ?? []).some((b) => b.i === a.i))
+      // ★ 找"交完新冒出来的按钮"（比如二次确认框）：编号带每次扫描的随机 token，
+      //   跨两次扫描比 i 永远对不上（2.0.1 修复：每次提交都误报确认框）→
+      //   改按稳定身份比（gate.newButtons）；跳到了新页面不算 —— 那是新页自己的按钮。
+      const confirmBtn = GATE.newButtons(r.areas ?? [], after.areas ?? [], { navigated: click.navigated })[0] ?? null
 
       NT.markDone(r.url, 'submit')
+      session.lastToken = null       // ★ 交过了 → 这套题的票据用掉了
 
       const out = {
         ok: true,
@@ -1108,20 +1172,25 @@ function applyInner(ctx, config = {}) {
       const work = await getWork()
       const r = await SEE.readAreas(work, { full: false })
       const areas = r.areas ?? []
-      const ledger = GATE.buildLedger(areas)
-      const lh = GATE.ledgerHash(ledger)
-      const valid = new Set(ledger.map((x) => String(x.n)))
+      // ★ 和 eye_check / hand_submit 同一个口径（gate.reviewContext）：
+      //   身份 = 全量清单哈希；ignore 从 session 取（eye_check 存的那份，没有就全量复核）。
+      //   bad 按"页面上真实有的"判（复核员手里可能是更早的全量清单，多给不算错），
+      //   missing 按"这一轮要复核的"判 —— 两个集合分开，别混。
+      const rc = GATE.reviewContext(areas, session.ignoreByLh)
+      const lh = rc.lh
+      const onPage = new Set(rc.full.map((x) => String(x.n)))
+      const required = new Set(rc.ledger.map((x) => String(x.n)))
 
-      const bad = Object.keys(picks).filter((k) => !valid.has(k))
+      const bad = Object.keys(picks).filter((k) => !onPage.has(k))
       if (bad.length) {
         return {
           ok: false, category: 'ARG',
           error: `你登记的编号 ${bad.join('/')} 不在这一页的清单里`,
-          expected: `这一页要复核的编号是：${[...valid].join('、') || '（没有）'}`,
+          expected: `这一页上的编号是：${[...onPage].join('、') || '（没有）'}`,
           example: '{"picks":{"1":["B"],"2":["对"]},"uncertain":[3]}',
         }
       }
-      const missing = [...valid].filter((n) => !(n in picks) && !uncertain.includes(Number(n)))
+      const missing = [...required].filter((n) => !(n in picks) && !uncertain.includes(Number(n)))
       if (missing.length) {
         return {
           ok: false, category: 'USAGE', error: 'REVIEW_INCOMPLETE',

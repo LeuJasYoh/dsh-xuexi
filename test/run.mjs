@@ -161,6 +161,21 @@ t('A38 index.js 里 checkArgs 一定排在做事之前', () => {
   ta('A38d 校验失败直接 return（不往下走）', /if \(!chk\.ok\) return chk/.test(src))
 })
 
+// ── A39–A41：settleMs 回归（2.0.1 修复：曾被 normLocator 的 unknownKey 误杀，
+//    参数声明了却永远用不了 —— A6 用越界值 99999 碰巧被错误检查拦下，掩盖了缺陷）──
+t('A39 hand_click 带 settleMs（编号定位）→ 通过', () => {
+  const r = A.checkArgs('hand_click', { i: 'r1:0', settleMs: 2000 })
+  eq(r.ok, true); eq(r.args.settleMs, 2000); eq(r.args.loc.i, 'r1:0')
+})
+t('A40 hand_click 带 settleMs（文字 / 坐标定位）→ 通过', () => {
+  eq(A.checkArgs('hand_click', { text: '下一题', settleMs: 500 }).ok, true)
+  eq(A.checkArgs('hand_click', { x: 100, y: 200, settleMs: 0 }).ok, true)
+})
+t('A41 settleMs 越界 / 类型错 → 仍然拦得住', () => {
+  eq(A.checkArgs('hand_click', { i: 'r1', settleMs: 99999 }).ok, false)
+  eq(A.checkArgs('hand_click', { i: 'r1', settleMs: '快' }).ok, false)
+})
+
 // ═══════════════════════════════════════════════════════════════════════════
 // B 复核闸门
 // ═══════════════════════════════════════════════════════════════════════════
@@ -336,6 +351,69 @@ t('B27 复核员重登记（round 2）且这次一致 → 重新可交', () => {
   eq(G.judgeSummary(store, 'L').registered, 2)
 })
 
+// ── B28–B33：口径统一 / ignore 全链路 / 新按钮判定（2.0.1 修复回归）───────────
+//
+// 缺陷背景：早先 eye_check 按 buildLedger(areas, ignore) 算哈希、hand_verdict /
+// hand_submit 按 buildLedger(areas) 算 —— 用了 ignore 之后三处对不上，
+// 复核登记永远查不到、票据永远 STALE_TOKEN，整条「复核 → 交」链路死锁。
+
+t('B28 ignore 不改变题目身份：三处的 lh 必须一致', () => {
+  const full = G.reviewContext(AREAS)
+  const withIgnore = G.reviewContext(AREAS, {}, [1])
+  eq(withIgnore.lh, full.lh)                              // ★ 身份 = 全量哈希，ignore 不参与
+  eq(withIgnore.ledger.length, full.ledger.length - 1)    // 要复核的少一处
+  eq(withIgnore.ledger[0].n, 2)                           // 编号仍是全量口径的 n
+  eq(withIgnore.ignore.join(), '1')
+})
+t('B29 ignore 记进 session 后，不带参数的另一处取到同一份', () => {
+  const a = G.reviewContext(AREAS, {}, [1])               // eye_check({ignore:[1]})
+  const store = { [a.lh]: a.ignore }                      // == session.ignoreByLh
+  const b = G.reviewContext(AREAS, store)                 // hand_verdict / hand_submit 的视角
+  eq(b.lh, a.lh)
+  eq(b.ignore.join(), '1')
+  eq(b.ledger.map((x) => x.n).join(), '2')
+})
+t('B30 没记过 ignore 的题 → 默认全量复核', () => {
+  const b = G.reviewContext(AREAS, {})
+  eq(b.ignore.length, 0)
+  eq(b.ledger.length, G.buildLedger(AREAS).length)
+})
+t('B31 全链路（缺陷复现）：eye_check({ignore}) → 复核登记 → 票据 → hand_submit 验票', () => {
+  // 第 1 步：eye_check({ignore:[1]}) —— 身份与 ignore 都定下来了
+  const rc = G.reviewContext(AREAS, {}, [1])
+  const store = { [rc.lh]: rc.ignore }                    // == session.ignoreByLh
+  const fp = G.pageFingerprint({ targetId: 'T', url: 'u', areas: AREAS })
+  // 第 2 步：复核员 hand_verdict（不带 ignore，从 store 取）→ 登记进 verdicts[lh]
+  const rv = G.reviewContext(AREAS, store)
+  let verdicts = {}
+  verdicts = G.recordVerdict(verdicts, { ledgerHash: rv.lh, judgeId: 'g1', picks: { 2: ['A'] } })
+  verdicts = G.recordVerdict(verdicts, { ledgerHash: rv.lh, judgeId: 'g2', picks: { 2: ['A'] } })
+  // 第 3 步：eye_check 查得到登记、走查通过、发票据
+  const entries = Object.entries(verdicts[rc.lh]).map(([id, v]) => ({ id, ...v }))
+  const gate = G.checkGate({ areas: AREAS, ledger: rc.ledger, entries, ignore: rc.ignore })
+  eq(gate.verdict, 'PASS')
+  const token = G.makeToken({ fingerprint: fp, ledgerHash: rc.lh, gate })
+  ta('B31b 有票据', !!token)
+  // 第 4 步：hand_submit（不带 ignore，从 store 取）→ 验票必须通过、走查必须过
+  const sm = G.reviewContext(AREAS, store)
+  eq(G.verifyToken(token, { fingerprint: fp, ledgerHash: sm.lh }).ok, true)
+  eq(G.checkGate({ areas: AREAS, ledger: sm.ledger, entries, ignore: sm.ignore }).verdict, 'PASS')
+})
+t('B32 新按钮按稳定身份比（编号带随机 token，跨扫描永不相等）', () => {
+  const before = [{ i: 'raa111:0', kind: 'button', tag: 'BUTTON', label: '提交', href: null, onclick: null }]
+  const afterSame = [{ i: 'rbb222:0', kind: 'button', tag: 'BUTTON', label: '提交', href: null, onclick: null }]
+  eq(G.newButtons(before, afterSame).length, 0)           // 同一个按钮：编号变了，身份没变
+  const afterNew = [...afterSame, { i: 'rbb222:1', kind: 'button', tag: 'BUTTON', label: '确定', href: null, onclick: null }]
+  eq(G.newButtons(before, afterNew).length, 1)            // 真·新冒出来的（确认框）
+  eq(G.newButtons(before, afterNew)[0].label, '确定')
+})
+t('B33 跳到新页面不报确认框（新页的按钮是它自己的）', () => {
+  const before = [{ i: 'raa111:0', kind: 'button', tag: 'BUTTON', label: '提交' }]
+  const after = [{ i: 'rbb222:0', kind: 'button', tag: 'A', label: '下一页' }]
+  eq(G.newButtons(before, after, { navigated: true }).length, 0)
+  eq(G.newButtons(before, after, { navigated: false }).length, 1)
+})
+
 // ═══════════════════════════════════════════════════════════════════════════
 // C 工具表面
 // ═══════════════════════════════════════════════════════════════════════════
@@ -458,7 +536,7 @@ t('E2 persona.prefix 必填且不带 complete', () => {
 t('E3 文件工具在白名单里（否则复核员读不了图）', () => ta('E3b', /@deepseek-ai\/dsh-tool-fs/.test(YML)))
 t('E4 package.json 对得上', () => {
   eq(PKG.name, 'dsh-xuexi')
-  eq(PKG.version, '2.0.0')
+  eq(PKG.version, '2.0.1')
   eq(PKG.dsh.id, 'dsh-xuexi')
   eq(PKG.dsh.repo, 'LeuJasYoh/dsh-xuexi')
 })

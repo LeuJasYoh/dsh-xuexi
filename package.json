@@ -1,6 +1,6 @@
 {
   "name": "dsh-xuexi",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "DSH 网课模式：工具只当手和眼，判断全归大模型 —— 截图、列能点的、点一个看变化，任何网课页面都能自己摸出来",
   "type": "module",
   "license": "MIT",
@@ -42,7 +42,7 @@
   "dsh": {
     "id": "dsh-xuexi",
     "name": "网课模式",
-    "version": "2.0.0",
+    "version": "2.0.1",
     "repo": "LeuJasYoh/dsh-xuexi",
     "engines": {
       "dsh": ">=0.2.0"
