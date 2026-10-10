@@ -89,9 +89,46 @@
           #
           # 顺序：后端（compaction-basic）在前，命令（command-compact）在后。
           # （image-offload 图片卸载宿主层已经是 active 的，不用列。）
-          - id: compaction-basic
-            name: '@deepseek-ai/dsh-compaction-basic'
-          - id: tool-result-pruner
-            name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
-          - id: command-compact
-            name: '@deepseek-ai/dsh-command-compact'
+          #
+          # ⚠️⚠️ 这三个【必须】包进一个 `cordis:group` 并声明 isolate ——
+          #   这是事故 2.2.1「网课模式加载失败」的根因，别再平铺。
+          #
+          #   预设挂载成功前会跑 leakedServices 检查
+          #   （@deepseek-ai/dsh-agent-preset-registry/lib）：
+          #       if (leaked.length > 0) throw new Error(
+          #         `Preset services require isolate realms: ${leaked.join(", ")}`)
+          #   一个【提供服务】的插件若不带 isolate 域，实现会被存进根域符号 →
+          #   整个预设 mount 抛错 → 界面打上 brokenBadge「加载失败」。
+          #
+          #   为什么 persona / tool-fs / dsh-xuexi 平铺一直没事：
+          #     它们只【消费】服务、只注册工具，不提供服务，因而不产生泄漏。
+          #   而 compaction-basic 提供 `compaction`、
+          #   tool-result-pruner 提供 `toolResultPruner` —— 两个都会泄漏。
+          #
+          #   isolate 取值语义（@deepseek-ai/cordis-plugin-loader）：
+          #     `true`   = 条目私有域（LocalRealm），兄弟条目互相看不见；
+          #     `"标签"` = 共享域（GlobalRealm），同标签条目共用一个域符号。
+          #   这里用 `true` 就够 —— 域挂在【组】这个条目上，
+          #   子条目经 `Object.create(entry.parent.ctx[Context.isolate])` 继承同一符号，
+          #   于是提供方和消费方看到的是同一个 compaction / toolResultPruner。
+          #
+          #   逐字照抄官方 preset-cordis 的形状
+          #   （dsh-web-app/presets/cordis.patch.yml）：
+          #   name: cordis:group + group: true + isolate + config 四样缺一不可。
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024

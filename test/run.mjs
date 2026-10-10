@@ -595,13 +595,57 @@ t('E2 persona.prefix 必填且不带 complete', () => {
   ta('E2c 没有 complete', !/^\s*complete:\s*true/m.test(YML))
 })
 t('E3 文件工具在白名单里（否则复核员读不了图）', () => ta('E3b', /@deepseek-ai\/dsh-tool-fs/.test(YML)))
-t('E3c 压缩三件套必须在预设白名单里（否则 /compact 和自动压缩都不存在）', () => {
-  // ★ 实测事故（2026-10-10）：这批插件被 web-app 组合在**宿主层禁用**（enabled:false），
-  //   只能靠预设的 plugins 列表显式加载。没列 = 命令不存在、自动压缩从不触发。
-  //   用户在网课模式里敲 /compact 没反应，就是这个原因（对照组：tool-fs 同机制、列了就能用）。
-  ta('E3d command-compact 在白名单', /@deepseek-ai\/dsh-command-compact/.test(YML), '缺 command-compact → /compact 命令不存在')
-  ta('E3e compaction-basic 在白名单', /@deepseek-ai\/dsh-compaction-basic/.test(YML), '缺 compaction-basic → 自动压缩从不触发')
-  ta('E3f tool-result-pruner 在白名单', /@deepseek-ai\/dsh-compaction-tool-result-pruner/.test(YML), '缺 tool-result-pruner → 长会话工具结果不瘦身')
+t('E3c 压缩三件套必须【包在 cordis:group 里】并声明 isolate', () => {
+  // ★★ 实测事故（2026-10-10，v2.2.1）：这三个曾被【平铺】进 plugins 列表，
+  //    结果网课模式一启动就「加载失败」。
+  //
+  //    根因：预设 mount 成功前会跑 leakedServices 检查
+  //    （@deepseek-ai/dsh-agent-preset-registry/lib）：
+  //        if (leaked.length > 0) throw new Error(
+  //          `Preset services require isolate realms: ${leaked.join(", ")}`)
+  //    一个【提供服务】的插件若不带 isolate 域，实现会被存进【根域】符号，
+  //    于是被判为泄漏，整个预设 mount 抛错，UI 打上 brokenBadge「加载失败」。
+  //
+  //    compaction-basic 提供 `compaction` 服务、
+  //    tool-result-pruner 提供 `toolResultPruner` 服务 —— 两个都会泄漏。
+  //    对照组：persona / tool-fs / dsh-xuexi 只【消费】服务、只注册工具，
+  //    不提供服务，所以平铺一直没事（这也是当初误判成"平铺即可"的原因）。
+  //
+  //    正确写法照抄官方 preset-cordis
+  //    （dsh-web-app/presets/cordis.patch.yml）：
+  //    cordis:group + group: true + isolate + config 四样缺一不可。
+  //    isolate 的 `true` 是条目私有域；域挂在【组】上时子条目
+  //    经 Object.create(entry.parent.ctx[Context.isolate]) 继承同一符号，
+  //    提供方与消费方才看得到同一个服务。
+  const group = /^(\s*)- id: compaction\s*\n\s+name: cordis:group\s*\n\s+group: true\s*\n\s+isolate:\s*\n([\s\S]*?)\n\s+config:/m.exec(YML)
+  ta('E3d 压缩三件套包在 cordis:group 里（group: true）', !!group,
+    '压缩三件套必须包进 cordis:group；平铺会导致服务泄漏 → 网课模式「加载失败」')
+  if (!group) return
+
+  const iso = group[2]
+  ta('E3e isolate 声明 compaction: true', /^\s*compaction:\s*true\s*$/m.test(iso),
+    '缺 isolate.compaction → compaction 服务泄漏进根域 → 预设加载失败')
+  ta('E3f isolate 声明 toolResultPruner: true', /^\s*toolResultPruner:\s*true\s*$/m.test(iso),
+    '缺 isolate.toolResultPruner → pruner 服务泄漏进根域 → 预设加载失败')
+
+  // 三个条目必须【缩进比 tool-fs 深】= 在组的 config 里，而不是与 tool-fs 平级平铺
+  const flat = /^(\s*)- id: tool-fs\s*$/m.exec(YML)
+  const baseIndent = flat ? flat[1].length : 0
+  for (const [label, mod, hint] of [
+    ['compaction-basic', '@deepseek-ai/dsh-compaction-basic', '缺 compaction-basic → 自动压缩从不触发'],
+    ['command-compact', '@deepseek-ai/dsh-command-compact', '缺 command-compact → /compact 命令不存在'],
+    ['tool-result-pruner', '@deepseek-ai/dsh-compaction-tool-result-pruner', '缺 tool-result-pruner → 长会话工具结果不瘦身'],
+  ]) {
+    const row = new RegExp('^(\\s*)- id: ' + label + '\\s*$', 'm').exec(YML)
+    ta('组内有 ' + label, !!row, hint)
+    if (!row) continue
+    ta(label + ' 在组内而非平铺', row[1].length > baseIndent,
+      label + ' 必须缩进在 cordis:group 的 config 里；平铺 = 服务泄漏 = 预设加载失败')
+    const after = YML.slice(row.index).split('\n').slice(0, 3).join('\n')
+    const q = mod.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
+    ta(label + ' 的 name 正确', new RegExp("^\\s*name:\\s*['\"]?" + q + "['\"]?\\s*$", 'm').test(after),
+      label + ' 的 name 应为 ' + mod)
+  }
 })
 t('E3g 提示词要告诉模型"适时收口，给用户压缩机会"', () => {
   ta('E3h 提到 /compact', /\/compact/.test(PROMPT), '提示词没提 /compact')
@@ -609,7 +653,7 @@ t('E3g 提示词要告诉模型"适时收口，给用户压缩机会"', () => {
 })
 t('E4 package.json 对得上', () => {
   eq(PKG.name, 'dsh-xuexi')
-  eq(PKG.version, '2.2.1')
+  eq(PKG.version, '2.2.2')
   eq(PKG.dsh.id, 'dsh-xuexi')
   eq(PKG.dsh.repo, 'LeuJasYoh/dsh-xuexi')
   eq(PKG.dsh.name, '网课模式')
