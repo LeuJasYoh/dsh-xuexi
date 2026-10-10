@@ -595,9 +595,21 @@ t('E2 persona.prefix 必填且不带 complete', () => {
   ta('E2c 没有 complete', !/^\s*complete:\s*true/m.test(YML))
 })
 t('E3 文件工具在白名单里（否则复核员读不了图）', () => ta('E3b', /@deepseek-ai\/dsh-tool-fs/.test(YML)))
+t('E3c 压缩三件套必须在预设白名单里（否则 /compact 和自动压缩都不存在）', () => {
+  // ★ 实测事故（2026-10-10）：这批插件被 web-app 组合在**宿主层禁用**（enabled:false），
+  //   只能靠预设的 plugins 列表显式加载。没列 = 命令不存在、自动压缩从不触发。
+  //   用户在网课模式里敲 /compact 没反应，就是这个原因（对照组：tool-fs 同机制、列了就能用）。
+  ta('E3d command-compact 在白名单', /@deepseek-ai\/dsh-command-compact/.test(YML), '缺 command-compact → /compact 命令不存在')
+  ta('E3e compaction-basic 在白名单', /@deepseek-ai\/dsh-compaction-basic/.test(YML), '缺 compaction-basic → 自动压缩从不触发')
+  ta('E3f tool-result-pruner 在白名单', /@deepseek-ai\/dsh-compaction-tool-result-pruner/.test(YML), '缺 tool-result-pruner → 长会话工具结果不瘦身')
+})
+t('E3g 提示词要告诉模型"适时收口，给用户压缩机会"', () => {
+  ta('E3h 提到 /compact', /\/compact/.test(PROMPT), '提示词没提 /compact')
+  ta('E3i 提到上下文管理', /上下文/.test(PROMPT), '提示词没提上下文管理')
+})
 t('E4 package.json 对得上', () => {
   eq(PKG.name, 'dsh-xuexi')
-  eq(PKG.version, '2.2.0')
+  eq(PKG.version, '2.2.1')
   eq(PKG.dsh.id, 'dsh-xuexi')
   eq(PKG.dsh.repo, 'LeuJasYoh/dsh-xuexi')
   eq(PKG.dsh.name, '网课模式')

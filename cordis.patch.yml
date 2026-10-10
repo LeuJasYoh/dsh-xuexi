@@ -64,3 +64,34 @@
           #   注意它**只在这个预设作用域里**生效，标准模式等其它模式不受影响。
           - id: tool-fs
             name: '@deepseek-ai/dsh-tool-fs'
+
+          # ── 上下文压缩三件套 ──────────────────────────────────────────────
+          #
+          # ⚠️ 为什么必须显式列出来（实测事故 2026-10-10）：
+          #   网页版组合 `@deepseek-ai/dsh-web-app` 有一个 **overrides 名单**，
+          #   把 `command-compact` / `compaction-basic` / `tool-result-pruner` / `tool-fs`
+          #   这批插件**在宿主层直接禁用**（enabled:false / fiberPhase:null），
+          #   只允许由**预设的 plugins 列表**显式加载进预设作用域。
+          #
+          #   实测：`include:command-compact` 宿主层 enabled:false —— 于是
+          #   「/compact」这个命令在**任何模式**里都不存在，用户敲了没反应；
+          #   同时 `compaction-basic` 也没加载 → **自动压缩从来没跑过**，
+          #   一次 2 小时 48 分的实测把上下文涨到 35.7 万 token，一次都没缩。
+          #
+          #   对照组：`dsh-tool-fs` 宿主层同样 enabled:false，
+          #   但 read/write/edit/read_image 能用 —— 因为上面列了它。
+          #   **同一机制：列了就有，没列就没有。**
+          #
+          # 命令注册契约（dsh-commands 文档）：
+          #   "A command-producing plugin mounted beneath an agent's own context
+          #    declares its `commands` injection and registers an agent-scoped command"
+          #   —— 挂进预设 = 给这个模式注册一个专属的 /compact，官方支持的用法。
+          #
+          # 顺序：后端（compaction-basic）在前，命令（command-compact）在后。
+          # （image-offload 图片卸载宿主层已经是 active 的，不用列。）
+          - id: compaction-basic
+            name: '@deepseek-ai/dsh-compaction-basic'
+          - id: tool-result-pruner
+            name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+          - id: command-compact
+            name: '@deepseek-ai/dsh-command-compact'
