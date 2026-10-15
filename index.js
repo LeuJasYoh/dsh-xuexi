@@ -383,7 +383,11 @@ function applyInner(ctx, config = {}) {
   /** 统一的错误包装：分清"是世界的问题"还是"工具的问题" */
   function wrapError(e) {
     const msg = String(e?.message ?? e ?? '未知错误')
-    const isTool = /Session with given id|Cannot find context|Execution context was destroyed|Target closed|Session closed|Detached while handling command|ECONNREFUSED|socket|WebSocket|超时|timed? ?out/i.test(msg)
+    // 「没有响应／无响应」要算 TOOL：实测（2026-10-15）eye_shot 撞上 CDP 60s 超时时报的是
+    // "Page.captureScreenshot 超过 60000ms 没有响应"，里面既没有"超时"也没有 "socket"，
+    // 于是被错判成 WORLD → hint 变成"退回三件万能事：eye_shot 看一眼 → …"，
+    // 让模型对着一个刚卡死的工具重试它自己。归到 TOOL 才会给出"用 eye_open 重新接管"这条真有用的。
+    const isTool = /Session with given id|Cannot find context|Execution context was destroyed|Target closed|Session closed|Detached while handling command|ECONNREFUSED|socket|WebSocket|超时|timed? ?out|没有响应|无响应/i.test(msg)
     return {
       ok: false,
       category: isTool ? 'TOOL' : 'WORLD',
@@ -960,7 +964,9 @@ function applyInner(ctx, config = {}) {
       '滚动。翻长文档、找下面的东西时用。\n'
       + '★ 页面常常有好几个区域（侧栏、正文…），默认滚的那一个**不一定是你想滚的那个**。\n'
       + '要滚指定区域，把那一处的定位给 `area`，或把窗口名给 `frame`。\n'
-      + '返回里会告诉你**实际滚的是哪个容器**；滚不动也会明说，不会沉默。',
+      + '返回里会告诉你**实际滚的是哪个容器**；滚不动也会明说，不会沉默。\n'
+      + '★ 每滚一步之间**已经自动停了一下**，所以这里没有（也别传）`dwellMs` 这类参数 —— '
+      + '想"慢翻"就小步多滚：`{"px":300,"times":20}`。大步快跳有些站点不认翻过。',
     parameters: {
       type: 'object',
       properties: {
@@ -1094,14 +1100,28 @@ function applyInner(ctx, config = {}) {
         changed += `，页面上标记已是「${mark}」`
       }
 
+      // ★ 只报事实，不下结论（与 lib/hand.mjs 的 playMedia 同一条规矩，两边必须一致）。
+      //
+      //   "播完了"是**播放器**的事实（ended / currentTime 到末尾）；
+      //   "任务点记上没有"是**服务端**的事，工具读不到，就**不许替它下结论**。
+      //
+      //   实测教训（2026-10-15 真机）：这一层曾经无条件输出"播完就算完成 —— 不用再确认"，
+      //   把 lib 层如实报的 markAfter（还是「未完成」）盖掉了 → 模型信了这句，
+      //   事后发现没记上就回头重播；目录其实已清零的那些，也被这句骗着重播了一遍。
+      //   同一个视频连播三遍仍"未完成"，正是这么来的。
       let hint
       if (r?.reason === 'FINISHED') {
-        if (mark && /已完成/.test(mark) && !/未完成/.test(mark)) {
-          hint = '播完就算完成 —— 页面上标记也对上了。继续下一条。'
+        if (mark && /未完成/.test(mark)) {
+          hint = '播完了 —— 但这个媒体的任务点标记**现在还是「未完成」**。\n'
+            + '这两件事工具分不开，只有两种可能，按序排除：\n'
+            + '① 标记是旧的：它是**页面加载时**渲染的，不刷新就不会变（最常见）→ 先刷新确认一次；\n'
+            + '② 刷新后仍然「未完成」，才是这次真的没记上 → 换个方式播，或记 hand_note 交给用户。\n'
+            + '**别因为看到「未完成」就原地再播一遍** —— 重播治不了"没记上"，只会白等一轮。'
+        } else if (mark && /已完成/.test(mark)) {
+          hint = '播完了，页面上的任务点标记也已经是「已完成」。继续下一条。'
         } else {
-          hint = '**播完就算完成** —— 正常情况不用再确认，继续下一条。\n'
-            + '（页面上那句标记是**页面加载时**渲染的，没刷新就还是旧值，'
-            + '看到「未完成」不代表没算上。真想核实就刷新一次再看。）'
+          hint = '播完了，但这个媒体的任务点标记**读不到**（没有、被隐藏、或结构不认识）—— 读不到就是不猜。\n'
+            + '想知道算没算上，刷新看一眼标记或目录数字；别把"播完了"直接当成"完成了"。'
         }
       } else {
         hint = '被中断了。按 reason 处理：被暂停/卡住 → 处理掉挡路的东西再 hand_play 一次；'
