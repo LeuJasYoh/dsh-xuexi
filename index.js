@@ -15,12 +15,12 @@
  *   ② 格式错在动手之前拦住，且零副作用（ARG / USAGE 失败 = 页面一下都没被碰过）
  *   ③ 大脑永远有退路：截图 → 列能点的 → 点一个看变化
  *
- * 15 个工具分三类：
+ * 16 个工具分三类：
  *   眼（5）  eye_open / eye_see / eye_list / eye_shot / eye_check
  *   手（6）  hand_click / hand_pick / hand_write / hand_scroll / hand_goto / hand_tab
- *   必要（4）hand_play / hand_submit / hand_note / hand_verdict
+ *   兜底（5）hand_play / hand_submit / hand_read / hand_note / hand_verdict
  *
- * 必要那四个留着不是因为它们"聪明"，而是因为只有两类动作需要代码兜住：
+ * 兜底那五个留着不是因为它们"聪明"，而是因为只有两类动作需要代码兜住：
  *   ① 涉及铁律（播放不能被作弊：原速 1x / 不拖拽 / 不伪造心跳）
  *   ② 做错回不了头（交答案，一般不给重做）
  */
@@ -1049,8 +1049,10 @@ function applyInner(ctx, config = {}) {
   })
 
   // ═════════════════════════════════════════════════════════════════════════
-  //  必要（4）—— 只有这两类动作需要代码兜住
-  //   ① 涉及铁律  ② 做错回不了头
+  //  兜底（5）—— 只有这两类动作需要代码兜住
+  //   ① 涉及铁律（hand_play）  ② 做错回不了头（hand_submit）
+  //   ③ 节奏敏感、手一快就白干（hand_read）  ④ 持久化 + 交给用户（hand_note）
+  //   ⑤ 只对复核员开放、身份由 ctx.agents 判定（hand_verdict）
   // ═════════════════════════════════════════════════════════════════════════
 
   reg({

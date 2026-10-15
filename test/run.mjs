@@ -721,7 +721,7 @@ t('E3g 提示词要告诉模型"适时收口，给用户压缩机会"', () => {
 })
 t('E4 package.json 对得上', () => {
   eq(PKG.name, 'dsh-xuexi')
-  eq(PKG.version, '2.2.3')
+  eq(PKG.version, '2.2.4')
   eq(PKG.dsh.id, 'dsh-xuexi')
   eq(PKG.dsh.repo, 'LeuJasYoh/dsh-xuexi')
   eq(PKG.dsh.name, '网课模式')
