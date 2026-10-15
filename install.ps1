@@ -1,6 +1,13 @@
 ﻿# install.ps1 -- install dsh-xuexi into the DSH desktop profile
 #
-# Compatibility:
+# Platform: WINDOWS ONLY -- on purpose, with no cross-platform abstraction.
+#   - Hard dependency on Windows: %USERPROFILE%\.dsh\profiles\<name>, the DSH
+#     Windows runtime layout, and Windows browser discovery.
+#   - There is no macOS / Linux branch and there must not be one: the plugin
+#     tool code may itself depend on Windows.
+#   - The guard near the top aborts immediately on any non-Windows host.
+#
+# PowerShell editions (both are Windows PowerShell here):
 #   - Windows PowerShell 5.1 (powershell.exe)
 #   - PowerShell 7+           (pwsh.exe)
 #
@@ -27,17 +34,23 @@
 #   pwsh       -File .\install.ps1          # preferred (PowerShell 7)
 #   powershell -File .\install.ps1          # also works (Windows PowerShell 5.1)
 #
-#   .\install.ps1 -DryRun                   # preview only
+#   .\install.ps1 -DryRun                   # preview only (never prompts)
 #   .\install.ps1 -VerifyOnly               # check the install, change nothing
-#   .\install.ps1 -Rollback <backup>        # restore a backup
+#   .\install.ps1 -Rollback <backup>        # restore a backup (never prompts)
 #   .\install.ps1 -ProfileName default      # a profile other than "desktop"
+#   .\install.ps1 -NonInteractive           # never prompts: no backup, no rollback
+#
+# Backup and rollback are OFF by default. A normal run asks two questions up
+# front and writes nothing extra unless the user says yes. -DryRun,
+# -VerifyOnly, -Rollback and -NonInteractive never ask.
 
 [CmdletBinding()]
 param(
     [switch]$DryRun,
     [switch]$VerifyOnly,
     [string]$Rollback,
-    [string]$ProfileName = 'desktop'
+    [string]$ProfileName = 'desktop',
+    [switch]$NonInteractive
 )
 
 $ErrorActionPreference = 'Stop'
@@ -54,6 +67,19 @@ if ($IsPwsh) {
     } catch {
         # Some hosts (ISE, remoting endpoints) reject this; not fatal.
     }
+}
+
+# ---------------------------------------------------------------------------
+# Platform guard: Windows only.
+#   Windows PowerShell 5.1 exists only on Windows, so it needs no check.
+#   PowerShell 7+ runs everywhere, so $IsWindows has to be checked there.
+#   Do not soften this into a "best effort" path -- other platforms are not
+#   supported at all.
+# ---------------------------------------------------------------------------
+if ($PSVersionTable.PSVersion.Major -ge 6 -and -not $IsWindows) {
+    Write-Host "[FAIL] dsh-xuexi is Windows-only: install.ps1 hard-depends on Windows paths and the DSH Windows runtime layout." -ForegroundColor Red
+    Write-Host "       Detected: $($PSVersionTable.OS)"
+    exit 1
 }
 
 # ---------------------------------------------------------------------------
@@ -85,6 +111,26 @@ function Fail {
     )
     $msg = if ($IsPwsh -and $Zh) { $Zh } else { $En }
     throw $msg
+}
+
+function Ask-YesNo {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$En,
+        [string]$Zh,
+        [switch]$DefaultYes
+    )
+    $text = if ($IsPwsh -and $Zh) { $Zh } else { $En }
+    $hint = if ($DefaultYes) { '[Y/n]' } else { '[y/N]' }
+    while ($true) {
+        $raw = $null
+        try { $raw = Read-Host "[?] $text $hint" } catch { $raw = $null }
+        $answer = if ($null -eq $raw) { '' } else { ([string]$raw).Trim().ToLowerInvariant() }
+        if ($answer -eq '')                     { return ([bool]$DefaultYes) }
+        if ($answer -match '^(y|yes|是)$')      { return $true }
+        if ($answer -match '^(n|no|否)$')       { return $false }
+        Write-Host "      y = yes / n = no (Enter = $(if ($DefaultYes) { 'y' } else { 'n' }))"
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -166,6 +212,10 @@ function Test-InstalledCopy {
             -Zh "[FAIL] 已安装副本与源文件不一致：" -Color Red
         foreach ($p in $problems) { Write-Host "         - $p" }
         Say -En "       Re-run: .\install.ps1" -Zh "       请重新运行: .\install.ps1"
+        if ($backup) {
+            Say -En "       Or roll back: .\install.ps1 -Rollback `"$backup`"" `
+                -Zh "       或还原: .\install.ps1 -Rollback `"$backup`""
+        }
         Fail -En "content verification failed" -Zh "内容校验失败"
     }
 
@@ -183,6 +233,12 @@ $NodeExe    = Join-Path $env:USERPROFILE '.dsh\dsh-runtimes\dsh-primary-runtime\
 $PnpmMjs    = Join-Path $env:USERPROFILE '.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\pnpm\bin\pnpm.mjs'
 $PatchMjs   = Join-Path $PluginDir 'scripts\patch-profile.mjs'
 $staleDir   = Join-Path $ProfileDir 'node_modules\dsh-xuexi'
+
+# Backup / rollback are opt-in. $backup stays $null until a backup is really
+# created -- every hint that mentions it is guarded on that.
+$backup           = $null
+$doBackup         = $false
+$keepRestorePoint = $false
 
 Say -En "PowerShell          : $($PSVersionTable.PSVersion)" `
     -Zh "PowerShell 版本      : $($PSVersionTable.PSVersion)"
@@ -247,8 +303,54 @@ if ($Rollback) {
     exit 0
 }
 
-# ---- 1) backup ------------------------------------------------------------
-if (-not $DryRun) {
+# ---- 0) interactive opt-in: backup / rollback support ----------------------
+# Both are OFF unless the user says yes here, and this runs before anything is
+# modified. -DryRun / -VerifyOnly / -Rollback / -NonInteractive skip it: the
+# first two change nothing, the third is already an explicit single-purpose
+# invocation, the fourth is for scripted runs.
+$promptable = (-not $DryRun) -and (-not $VerifyOnly) -and (-not ([bool]$Rollback)) -and (-not $NonInteractive)
+
+if ($promptable) {
+    Write-Host ""
+    Say -En "Backup and rollback are off by default. Two questions:" `
+        -Zh "备份与回滚默认关闭。有两个问题：" -Color Cyan
+
+    $doBackup = Ask-YesNo `
+        -En "Create a backup of the profile package.json before modifying it?" `
+        -Zh "是否在修改前备份配置档 package.json？"
+
+    if ($doBackup) {
+        $keepRestorePoint = Ask-YesNo `
+            -En "Keep it as a restore point (usable later via -Rollback)? If no, it is only a safety net for this run and is removed after a successful install." `
+            -Zh "是否保留它作为还原点（之后可用 -Rollback 还原）？选「否」则仅作本次安装兜底，安装成功后自动删除。"
+    } else {
+        $keepRestorePoint = Ask-YesNo `
+            -En "Enable rollback support for this install?" `
+            -Zh "是否为本次安装启用回滚支持？"
+        if ($keepRestorePoint) {
+            $flip = Ask-YesNo -DefaultYes `
+                -En "Rollback needs a restore point, and the restore point IS the backup. Turn backup ON as well?" `
+                -Zh "回滚需要一个还原点，而还原点就是备份。是否同时打开备份？"
+            if ($flip) { $doBackup = $true } else { $keepRestorePoint = $false }
+        }
+    }
+
+    Write-Host ""
+    Say -En "Decided      : backup=$(if ($doBackup) { 'yes' } else { 'no' })   restore-point=$(if ($keepRestorePoint) { 'yes' } else { 'no' })" `
+        -Zh "本次设置    : 备份=$(if ($doBackup) { '是' } else { '否' })   还原点=$(if ($keepRestorePoint) { '是' } else { '否' })"
+    if (-not $doBackup) {
+        Say -En "[i ] no backup file will be created, and rollback is unavailable" `
+            -Zh "[i ] 不会生成任何备份文件，回滚不可用"
+    } elseif (-not $keepRestorePoint) {
+        Say -En "[i ] backup is temporary: it is removed after a successful install" `
+            -Zh "[i ] 备份为临时性质：安装成功后自动删除"
+    }
+} elseif ($NonInteractive -and (-not $DryRun) -and (-not $VerifyOnly) -and (-not ([bool]$Rollback))) {
+    Say -En "[i ] -NonInteractive: backup off, rollback off" -Zh "[i ] -NonInteractive：不备份、不启用回滚"
+}
+
+# ---- 1) backup (only if the user opted in) --------------------------------
+if ($doBackup) {
     $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
     $backup = "$PkgPath.bak-$stamp"
     Copy-Item $PkgPath $backup -Force
@@ -265,6 +367,8 @@ if ($LASTEXITCODE -ne 0) {
 
 if ($DryRun) {
     Write-Host ""
+    Say -En "[dry] nothing written: no backup, no package.json change, no install." `
+        -Zh "[dry] 未写入任何内容：无备份、未改 package.json、未安装。" -Color Green
     Say -En "[dry] done. Re-run without -DryRun to apply." `
         -Zh "[dry] 试运行完成。去掉 -DryRun 参数重新运行即可应用更改。" -Color Green
     exit 0
@@ -314,8 +418,13 @@ if ($code -ne 0) {
     Write-Host ""
     Say -En "[FAIL] pnpm add exited with code $code" `
         -Zh "[FAIL] pnpm add 退出，代码 $code" -Color Red
-    Say -En "Rollback:" -Zh "回滚命令:"
-    Write-Host "  .\install.ps1 -Rollback `"$backup`""
+    if ($backup) {
+        Say -En "Rollback:" -Zh "回滚命令:"
+        Write-Host "  .\install.ps1 -Rollback `"$backup`""
+    } else {
+        Say -En "[i ] no backup for this run (backup was off) - restore manually from an earlier backup if you have one" `
+            -Zh "[i ] 本次未创建备份（备份已关闭）—— 如需还原，请手动指定以往某次运行的备份文件"
+    }
     Fail -En "pnpm add failed" -Zh "pnpm add 失败"
 }
 
@@ -347,5 +456,16 @@ Say -En "  3. If the new-task selector is missing, turn on General -> coding too
 Say -En "  4. Pick the 'Online-course' (xuexi) mode, then say: take over the browser first" `
     -Zh "  4. 选择 '网课模式'（xuexi），然后说: take over the browser first"
 Write-Host ""
-Say -En "Rollback:" -Zh "回滚命令:"
-Write-Host "  .\install.ps1 -Rollback `"$backup`""
+if ($backup) {
+    if ($keepRestorePoint) {
+        Say -En "Rollback:" -Zh "回滚命令:"
+        Write-Host "  .\install.ps1 -Rollback `"$backup`""
+    } else {
+        Remove-Item -LiteralPath $backup -Force
+        Say -En "[i ] temporary backup removed (rollback support was off) - nothing left behind" `
+            -Zh "[i ] 临时备份已删除（本次未启用回滚支持），未留下任何文件"
+    }
+} else {
+    Say -En "[i ] no backup was created (backup off) - there is no restore point for this run" `
+        -Zh "[i ] 本次未创建备份（备份关闭），没有可回滚的还原点"
+}
