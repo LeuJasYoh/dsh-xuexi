@@ -237,12 +237,15 @@ function applyInner(ctx, config = {}) {
   const port = config.port ?? DEFAULT_PORT
 
   /** 这次会话的状态（浏览器句柄 + 复核登记簿） */
-  const session = { browser: null, work: null, verdicts: {}, lastToken: null, busy: false, ignoreByLh: {}, lastSig: null, dirty: true }
+  const session = { browser: null, work: null, verdicts: {}, lastToken: null, busy: false, ignoreByLh: {}, ignoreWriteByLh: {}, lastSig: null, dirty: true, ownTargets: new Set(), pendingConfirm: null }
 
   // ★ "页面内容签名"记事本（省图用，改进）：每次"看"记下 readAreas 给的 sig；
   //   之后任何"手"动作把 dirty 置 true（见下面 reg 外壳）。eye_shot 据此判断
   //   "页面跟上次看的时候是不是同一内容"——是就不必重新烧一张图。
   const noteSig = (r) => { if (r?.sig) { session.lastSig = r.sig; session.dirty = false } }
+
+  // 稳定的页面标识：题目身份与票据只认它，元素编号每次扫描都变、绝不能当身份用
+  const stablePageKey = (work, url) => `${String(work?.targetId ?? '')}|${String(url ?? '')}`
 
   // ── 过程文件落在哪：<工作区>/.xuexi/ ──────────────────────────────────────
   //
@@ -349,10 +352,17 @@ function applyInner(ctx, config = {}) {
       port: state.browser?.port ?? port,
       profileDir: state.browser?.profileDir ?? DEFAULT_PROFILE,
     })
+    // avoid = 插件自己动过的标签页（本会话导航过的 + 状态里记着的上一个工作页）。
+    // ⓪「跟随用户那一页」在浏览器窗口失焦时必然落空（所有页都报 hidden），
+    // 所以 ② 必须能自己绕开这些页，否则用户翻好的那一页会被永远晾在一边。
+    const avoid = new Set(session.ownTargets)
+    if (state.browser?.workTargetId) avoid.add(state.browser.workTargetId)
     const work = await B.ensureWorkTab(browser, {
       targetId: targetId ?? ((relaunch || preferForeground) ? null : state.browser?.workTargetId),
       preferForeground: preferForeground || relaunch,
+      avoid: [...avoid],
     })
+    session.ownTargets.add(work.targetId)
     // 每次都把实际用的标签页写回状态：ensureWorkTab 可能复用了"用户在用的那一页"
     if (state.browser?.workTargetId !== work.targetId) {
       state.browser = {
@@ -370,14 +380,26 @@ function applyInner(ctx, config = {}) {
   /** 浏览器里开着哪几个标签页（形状按底层来，这里只做防守式映射） */
   async function tabsOf(browser) {
     const pages = await B.listPages(browser).catch(() => [])
-    return (pages ?? []).map((p, i) => ({
-      i,
-      id: p.targetId ?? p.id ?? null,
-      url: String(p.url ?? ''),
-      title: p.title ?? null,
-      blank: !p.url || /^about:/.test(String(p.url)),
-      active: p.visible === true || p.active === true,
-    }))
+    // ★ CDP 的 Target.getTargets 不报 visible / focus，所以 active 只能逐个 attach 问
+    //   （2026-10-17 真机：三个标签页全报 active:false，模型因此看不出哪个是用户打开的）。
+    //   浏览器窗口失焦时所有页都会报 hidden —— 那时别据此判断"用户没打开页面"。
+    const probe = await B.probeTabs(browser).catch(() => new Map())
+    return (pages ?? []).map((p, i) => {
+      const id = p.targetId ?? p.id ?? null
+      const fg = probe.get(id) ?? null
+      return {
+        i,
+        id,
+        url: String(p.url ?? ''),
+        title: p.title ?? null,
+        blank: !p.url || /^about:/.test(String(p.url)),
+        active: p.visible === true || p.active === true || Boolean(fg?.visible),
+        visible: fg ? fg.visible : null,
+        focused: fg ? fg.focused : null,
+        // 这个标签页是不是插件自己动过的（自己新建的 / 导航过的）
+        mine: session.ownTargets.has(id),
+      }
+    })
   }
 
   /** 统一的错误包装：分清"是世界的问题"还是"工具的问题" */
@@ -516,9 +538,33 @@ function applyInner(ctx, config = {}) {
         bound: bound ?? { id: work.targetId, url, title },
         tabs,
         notes: NT.noteDigest(10),
-        next: tab
-          ? '已接到你指定的标签页。'
-          : '已连上你正在看的这一页 —— **没动它**。先 eye_see 看这一页有什么。',
+        // ★ next 必须把"我绑的是哪一页、还有没有别人的页"说清楚（2026-10-17 真机）：
+        //   ⓪「跟随用户那一页」靠 visibilityState，而浏览器窗口失焦时所有页都报 hidden
+        //   （用户忙着在 DSH 里打字就是这种），所以插件很容易绑回自己那一页。
+        //   早先这里无条件说"已连上你正在看的这一页"，用户那边"我明明打开了页面"全程对不上。
+        //   现在：把**不是插件动过的**内容页列出来，让模型用 hand_tab 切过去，而不是
+        //   拿 hand_goto 把用户那一页导航掉。
+        ...(() => {
+          const foreign = tabs.filter((t) => !t.blank && !t.mine)
+          if (tab) return { next: '已接到你指定的标签页。' }
+          if (foreign.length) {
+            const what = bound && bound.blank ? '是我自己建的那个空白页' : `是「${bound?.title ?? '?'}」`
+            return {
+              next: `⚠️ 我绑到的这一页${what}，但这个浏览器里还有 ${foreign.length} 个**不是我动过的**标签页：\n`
+                + foreign.map((t) => `  [${t.i}] ${t.title}${t.visible ? '（当前可见）' : ''}`).join('\n')
+                + '\n如果用户说他打开过页面，那大概率就在这里面 —— 用 **hand_tab({ i })** 切过去，'
+                + '**不要**用 hand_goto 把它导航掉。',
+            }
+          }
+          if (bound && bound.blank) {
+            return {
+              next: '⚠️ 我绑到的是我自己建的空白页，这个浏览器里目前没有别的内容页。\n'
+                + '在**这个浏览器窗口**里打开要做的那一页（登录态在 ~/.dsh/xuexi/browser-profile，跨会话复用），'
+                + '或者把网址告诉我，我用 hand_goto 打开。',
+            }
+          }
+          return { next: '已连上你正在看的这一页 —— **没动它**。先 eye_see 看这一页有什么。' }
+        })(),
       }
     },
   })
@@ -570,6 +616,59 @@ function applyInner(ctx, config = {}) {
               : '')
           : '这一页没看到要处理的地方 —— 要么类型不对（用 eye_list 看看有什么能点的），要么已经做完了。',
       }
+    },
+  })
+
+  reg({
+    name: 'eye_paper',
+    description:
+      '★ **一次拿整卷**：把这一页的题目按屏幕顺序编成 1..N，并把题目区裁成尽量少的图（超长自动分段）。\n'
+      + '为什么要它：`eye_see` 只说"有几处"，题目得一屏一屏截图才看得全（实测 5 题滚 6 次、截 4 张）。\n'
+      + '而做题的是子 Agent，它**不会滚动** —— 必须一次给它完整的图。\n'
+      + '★ 题干**只在图里**，不在文字里：DOM 文字可能被字体搅过，给文字只会带偏。\n'
+      + '★ 图默认**不嵌进你的上下文**（embed:false），只落盘给你转交；路径在 `shots[].file`。',
+    parameters: {
+      type: 'object',
+      properties: {
+        shot: { type: 'boolean', description: '是否截图，默认 true。只要结构不要图就传 false' },
+        maxHeight: { type: 'number', description: '单张图最高多少像素，默认 2400（超了按题分段）' },
+      },
+      additionalProperties: false,
+    },
+    isConcurrencySafe: () => true,
+    async run({ shot = true, maxHeight = 2400 }) {
+      const work = await getWork()
+      const paper = await SEE.readPaper(work, { maxHeight })
+      if (!paper.total) {
+        return {
+          ok: false, category: 'WORLD', error: 'NO_PAPER',
+          hint: '这一页没读到题目（没有可挑区、也没有可写区）。先 eye_see 看这一页到底是什么；'
+            + '不是题目页就别用这个工具。',
+        }
+      }
+      // ★ 登记键必须用 ledger 的 n（与 eye_check 同一个口径），**不是**题号 1..N。
+      //   3.5 实测：eye_paper 说"第 1 题"，ledger 里那道题是 n=3（前面还有两个
+      //   非题的可挑区）—— 复核员按题号登记，eye_check 读到 registered:0，票据发不出。
+      const ledger = GATE.buildLedger(paper.areas ?? [])
+      const wLedger = GATE.buildWriteLedger(paper.areas ?? [])
+      for (const it of paper.items) {
+        const hit = it.kind === 'pick'
+          ? ledger.find((x) => String(x.i) === String(it.i))
+          : wLedger.find((x) => String(x.i) === String(it.i))
+        it.key = it.kind === 'pick' ? (hit?.n ?? null) : (hit?.w ?? null)
+      }
+      delete paper.areas       // 整页几十处可操作元素，别塞进上下文
+      if (!shot || !paper.segments.length) return { ok: true, ...paper }
+
+      const shots = []
+      for (const seg of paper.segments) {
+        const s = await takeShot(ctx, work, { label: `paper-p${seg.n}`, clip: seg.clip, embed: false })
+          .catch((e) => ({ error: String(e?.message ?? e).slice(0, 100) }))
+        shots.push(s?.error
+          ? { covers: seg.covers, error: s.error }
+          : { file: s.file, bytes: s.bytes, covers: seg.covers })
+      }
+      return { ok: true, ...paper, shots }
     },
   })
 
@@ -775,7 +874,7 @@ function applyInner(ctx, config = {}) {
     name: 'eye_check',
     description:
       '★ 交之前的复核（**只读，跑多少次都不影响页面**）。\n'
-      + '走查七条：挑的有没有空着 / 选了页面上没有的项 / 写的是不是空的 / '
+      + '走查八条：挑的有没有空着 / 选了页面上没有的项 / 写的是不是空的 / 写字处答案和复核员一不一致 / '
       + '复核员够不够两份 / 三份一不一致 / 还有没有拿不准的 / 你指定的"交"按钮在不在。\n'
       + '★ 全部通过才给**票据**（token）；没有票据就交不出去。不一致时**永远不给票据**。',
     parameters: {
@@ -785,21 +884,36 @@ function applyInner(ctx, config = {}) {
           type: 'array', items: { type: 'number' },
           description: '哪几处不是要答的题（比如一个无关的勾选框），不用复核。填对账清单的编号 n。',
         },
-        submitButton: LOCATOR_SCHEMA,
+        ignoreWrite: {
+          type: 'array', items: { type: 'number' },
+          description: '★ 哪几处**能写字的地方不是题**（比如右上角那个「搜索」框）—— 填写字清单的编号 w。\n'
+            + '不管的话它会被当成"一道没答的填空题"，永远拦住提交。',
+        },
+        submitButton: {
+          ...LOCATOR_SCHEMA,
+          description: '要交的那个按钮，用来确认它还在页面上。用最近一次 eye_see / eye_list 给的编号即可（{i} 可以用）。',
+        },
       },
       additionalProperties: false,
     },
     isConcurrencySafe: () => true,
-    async run({ ignore, submitButton }) {
+    async run({ ignore, ignoreWrite, submitButton }) {
       const work = await getWork()
+      // ★ 先解析按钮**再**重扫：readAreas 会重打全部编号，反过来做等于先把手里的编号
+      //   弄死、再拿死编号去找按钮 —— {i} 必然 NO_SUBMIT_TARGET（2026-10-17 真机）。
+      const hit = submitButton
+        ? await SEE.findElementByLocator(work, submitButton).catch(() => ({ found: false }))
+        : null
+      const submitFound = submitButton ? Boolean(hit?.found && hit.visible !== false) : true
       const r = await SEE.readAreas(work, { full: false })
       const areas = r.areas ?? []
       noteSig(r)
       // ★ 三处共用同一个口径（gate.reviewContext）：题目身份 = 全量清单哈希，
-      //   ignore 只筛"要复核哪几处"，并按身份记进 session —— hand_verdict / hand_submit 取同一份。
-      //   （2.0.1 修复：早先这里带 ignore、另两处不带，哈希对不上 → 用了 ignore 就永远交不了卷。）
-      const rc = GATE.reviewContext(areas, session.ignoreByLh, ignore)
+      //   ignore / ignoreWrite 只筛"要复核哪几处"，并按身份记进 session，另两处取同一份。
+      //   pageKey 必须稳定（targetId + url）—— 混进随机编号时三处会算出三个 key。
+      const rc = GATE.reviewContext(areas, session.ignoreByLh, ignore, stablePageKey(work, r.url), session.ignoreWriteByLh, ignoreWrite)
       session.ignoreByLh = { ...session.ignoreByLh, [rc.lh]: rc.ignore }
+      session.ignoreWriteByLh = { ...session.ignoreWriteByLh, [rc.lh]: rc.ignoreWrite }
       const ledger = rc.ledger
       const lh = rc.lh
       const fingerprint = GATE.pageFingerprint({ targetId: work.targetId, url: r.url, areas })
@@ -817,13 +931,7 @@ function applyInner(ctx, config = {}) {
         }
       }
 
-      let submitFound = true
-      if (submitButton) {
-        const hit = await SEE.findElementByLocator(work, submitButton).catch(() => ({ found: false }))
-        submitFound = Boolean(hit?.found && hit.visible !== false)
-      }
-
-      const gate = GATE.checkGate({ areas, ledger, entries, ignore, submitButton, submitFound })
+      const gate = GATE.checkGate({ areas, ledger, entries, ignore, submitButton, submitFound, writeLedger: rc.writeLedger, ignoreWrite: rc.ignoreWrite })
       const token = GATE.makeToken({ fingerprint, ledgerHash: lh, gate })
       if (token) session.lastToken = { token, fingerprint, ledgerHash: lh, at: Date.now() }
 
@@ -832,7 +940,12 @@ function applyInner(ctx, config = {}) {
         verdict: gate.verdict,
         canSubmit: gate.pass,
         token,
-        ledger,
+        // ★ 清单编号给**全量**（1..N），被排除的标 ignored。
+        //   早先返回的是过滤后的清单（3..7），复核员以为编号从 3 开始，
+        //   主脑据此给 α 派了 5..9 的题号 —— α 一登记就被拒（2026-10-17 真机）。
+        ledger: rc.full.map((x) => ({ ...x, ignored: rc.ignore.includes(x.n) })),
+        writes: GATE.buildWriteLedger(areas)
+          .map((x) => ({ w: x.w, i: x.i, ignored: (rc.ignoreWrite ?? []).includes(x.w) })),
         areas: {
           total: areas.length,
           pick: areas.filter((a) => a.kind === 'pick').length,
@@ -888,7 +1001,13 @@ function applyInner(ctx, config = {}) {
       // ★ 软保护必须在**点击之前**（2.0.1 修复：早先点完才检查，"拦住"说出口时
       //   答案其实已经交上去了）。先只读地看一眼目标，像"提交"就走 hand_submit。
       const peek = await peekTargetLabel(work, loc)
-      if (SUBMIT_LIKE.test(peek) && !session.lastToken) {
+      // ★ 确认框通道：hand_submit 点完「交」常弹二次确认框，框里那个「提交」也命中
+      //   SUBMIT_LIKE。不放行的话唯一正确的点法被自己的软保护拦住，模型只能反复
+      //   hand_submit（实测同一份卷子交了 5 次）。只放行"刚提交过、等着确认"这一次。
+      const pending = session.pendingConfirm
+        && Date.now() - session.pendingConfirm.at < 5 * 60_000
+        && session.pendingConfirm.tid === work.targetId   // 换了标签页就不认（不是同一个确认框）
+      if (SUBMIT_LIKE.test(peek) && !session.lastToken && !pending) {
         return {
           ok: false, category: 'USAGE', error: 'SUBMIT_MUST_GO_THROUGH_HAND_SUBMIT',
           expected: '交答案只能用 hand_submit —— 它会先复核（空着的、越界的、复核员够不够、三份一不一致），过了才点。',
@@ -898,6 +1017,10 @@ function applyInner(ctx, config = {}) {
       }
       const r = await HAND.clickLocator(work, loc, { settleMs })
       const out = { ok: true, ...r }
+      if (pending && SUBMIT_LIKE.test(peek)) {
+        session.pendingConfirm = null      // 一次性：确认框只放行这一下
+        out.next = '这是 hand_submit 弹出的确认框按钮。点完用 eye_see 确认页面是否出现"已提交"/分数 —— **不要重复 hand_submit**。'
+      }
       // 看漏了（图标按钮没文字之类）点完才发现像"提交" → 如实警告，绝不谎报"拦住了"
       const clickedText = String(r?.clicked?.text ?? '')
       if (SUBMIT_LIKE.test(clickedText) && !SUBMIT_LIKE.test(peek)) {
@@ -912,7 +1035,8 @@ function applyInner(ctx, config = {}) {
     name: 'hand_pick',
     description:
       '★ 在某个「可挑区」里挑选项。单选、多选、判断、下拉 —— **对它来说都是同一件事**。\n'
-      + '只认识页面上**真实存在**的选项：给了一个页面上没有的，它会报 rejected 并告诉你实际有哪几个，**绝不瞎点**。',
+      + '只认识页面上**真实存在**的选项：给了一个页面上没有的，它会报 rejected 并告诉你实际有哪几个，**绝不瞎点**。\n'
+      + '报 PICK_NOT_APPLIED = 点了但页面没选中（这不是成功）—— 改用 eye_list 拿 LI 编号走 hand_click，或 hand_click({x,y})。',
     parameters: {
       type: 'object',
       properties: {
@@ -930,7 +1054,29 @@ function applyInner(ctx, config = {}) {
       const r = await HAND.pickOptions(work, { area, choose, mode })
       // ★ 页面上的答案变了 → 旧票据作废（rejected = 整批没动过，票据仍然有效）
       if (!r?.rejected?.length) session.lastToken = null
-      return { ok: true, ...r, changed: `这一处现在选中 ${r?.areaState?.selected ?? '?'} / 共 ${r?.areaState?.total ?? '?'} 个选项` }
+      const sel = `这一处现在选中 ${r?.areaState?.selected ?? '?'} / 共 ${r?.areaState?.total ?? '?'} 个选项`
+
+      // ★ 不谎报成功：早先 ok 写死 true，判断题点了页面没反应（how:'gone'）也报成功，
+      //   模型以为答上了、反复重试到烧完预算。只有回读到的 now===true 才算数。
+      const vd = GATE.pickOutcome({ picked: r?.picked, rejected: r?.rejected, areaState: r?.areaState, mode: mode ?? 'set' })
+      if (!vd.ok && vd.code === 'PICK_REJECTED') {
+        return {
+          ok: false, category: 'USAGE', error: 'PICK_REJECTED',
+          rejected: r.rejected, changed: null,
+          hint: '一个像素都没碰：给的选项里有不合格的。按 rejected 里的 reason 改（实际有哪些选项也写在里面）。',
+        }
+      }
+      if (!vd.ok) {
+        return {
+          ok: false, category: 'WORLD', error: 'PICK_NOT_APPLIED',
+          ...r, changed: sel,
+          hint: vd.miss.length
+            ? `「${vd.miss.map((p) => p.label).join('、')}」点了但页面没选中（how: ${(r.how ?? []).join('/')}）。`
+              + '换条路：eye_list 拿这个选项的 LI 编号 → hand_click({ i })，或 hand_click({ x, y }) 点它的坐标。别原样重试。'
+            : `要全取消，但还留着 ${r?.areaState?.selected ?? '?'} 个选中 —— 看看是不是点不动（disabled / 被遮住）。`,
+        }
+      }
+      return { ok: true, ...r, changed: sel }
     },
   })
 
@@ -1147,7 +1293,9 @@ function applyInner(ctx, config = {}) {
     description:
       '★ 把这一页上**你已经弄好的东西**交上去。\n'
       + '它**不接受任何答案** —— 答案是你用 hand_pick / hand_write 亲手弄在页面上的，工具直接读页面。\n'
-      + '交之前会**自己再复核一遍**：没有有效票据就交不出去，页面一动不动。',
+      + '交之前会**自己再复核一遍**：没有有效票据就交不出去，页面一动不动。\n'
+      + '★ 交完**必须看 ok**：ok:false 就是没交上（SUBMIT_NEED_CONFIRM = 弹了确认框，用 hand_click 点；'
+      + 'SUBMIT_UNCONFIRMED = 没有任何"交上了"的迹象，先 eye_see）。**任何情况都别再 hand_submit 一次**。',
     parameters: {
       type: 'object',
       properties: {
@@ -1163,13 +1311,17 @@ function applyInner(ctx, config = {}) {
     async run({ reviewed, button }) {
       const work = await getWork()
       const before = await work.eval('location.href').catch(() => null)
+      // ★ 先解析按钮**再**重扫（同 eye_check）：readAreas 会重打编号，反过来做的话
+      //   button:{i} 必然找不到 → 恒 NO_SUBMIT_TARGET，模型只能自己摸坐标（2026-10-17 真机）。
+      const hit = await SEE.findElementByLocator(work, button).catch(() => ({ found: false }))
+      const submitFound = Boolean(hit?.found && hit.visible !== false)
       const r = await SEE.readAreas(work, { full: false })
       const areas = r.areas ?? []
       noteSig(r)
       // ★ 和发票据那次同一个口径（gate.reviewContext）：身份 = 全量清单哈希，
       //   ignore 从 session 取 —— eye_check({ignore}) 存进去的那份。
-      //   （2.0.1 修复：早先这里不带 ignore → 票据永远 STALE_TOKEN、被忽略处又报空。）
-      const rc = GATE.reviewContext(areas, session.ignoreByLh)
+      //   pageKey 必须与 eye_check 发票据那次完全一致。
+      const rc = GATE.reviewContext(areas, session.ignoreByLh, undefined, stablePageKey(work, r.url), session.ignoreWriteByLh)
       const ledger = rc.ledger
       const lh = rc.lh
       const fingerprint = GATE.pageFingerprint({ targetId: work.targetId, url: r.url, areas })
@@ -1184,11 +1336,11 @@ function applyInner(ctx, config = {}) {
         }
       }
 
-      // ★ 票据只是"你看过一次"；这里**自己再走一遍**七条
-      const hit = await SEE.findElementByLocator(work, button).catch(() => ({ found: false }))
+      // ★ 票据只是"你看过一次"；这里**自己再走一遍**八条
       const gate = GATE.checkGate({
         areas, ledger, entries, ignore: rc.ignore, submitButton: button,
-        submitFound: Boolean(hit?.found && hit.visible !== false),
+        submitFound,
+        writeLedger: rc.writeLedger, ignoreWrite: rc.ignoreWrite,
       })
       if (!gate.pass) {
         return {
@@ -1200,13 +1352,13 @@ function applyInner(ctx, config = {}) {
 
       const click = await HAND.clickLocator(work, button, { settleMs: 2500 })
 
-      // 交完回读：分数 / 是不是弹出了二次确认
+      // 交完回读：分数 / 页面文案 / 是不是弹出了二次确认
       const after = await SEE.readAreas(work, { full: false }).catch(() => ({ areas: [] }))
       noteSig(after)
-      const scoreText = await work.eval(
+      const probe = await work.eval(
         `(() => { const t = document.body ? document.body.innerText : '';`
         + ` const m = t.match(/(\\d+(?:\\.\\d+)?)\\s*\\/\\s*(\\d+(?:\\.\\d+)?)/);`
-        + ` return m ? { score: parseFloat(m[1]), full: parseFloat(m[2]) } : null })()`,
+        + ` return { score: m ? parseFloat(m[1]) : null, full: m ? parseFloat(m[2]) : null, text: t.slice(0, 4000) } })()`,
       ).catch(() => null)
 
       // ★ 找"交完新冒出来的按钮"（比如二次确认框）：编号带每次扫描的随机 token，
@@ -1214,15 +1366,49 @@ function applyInner(ctx, config = {}) {
       //   改按稳定身份比（gate.newButtons）；跳到了新页面不算 —— 那是新页自己的按钮。
       const confirmBtn = GATE.newButtons(r.areas ?? [], after.areas ?? [], { navigated: click.navigated })[0] ?? null
 
-      NT.markDone(r.url, 'submit')
-      session.lastToken = null       // ★ 交过了 → 这套题的票据用掉了
-
-      const out = {
-        ok: true,
+      // ★ "点了按钮" ≠ "交上了"：早先 ok 写死 true，同一份卷子连交 5 次都说"交了"。
+      //   判据在 gate.submitOutcome（纯函数，可单测）：跳页 / 分数 / 页面自己说交了。
+      const vd = GATE.submitOutcome({
+        navigated: click.navigated, score: probe?.score, text: probe?.text, hasConfirm: Boolean(confirmBtn),
+      })
+      const applied = vd === 'APPLIED'
+      const base = {
         urlBefore: before, urlAfter: click.urlAfter, navigated: click.navigated,
-        score: scoreText?.score ?? null,
-        fullScore: scoreText?.full ?? null,
-        changed: click.navigated ? `交完跳到了 ${click.urlAfter}` : '交了（页面没跳转）',
+        score: typeof probe?.score === 'number' ? probe.score : null,
+        fullScore: typeof probe?.full === 'number' ? probe.full : null,
+      }
+
+      session.lastToken = null       // ★ 点过「交」→ 不管成没成，这张票都用掉了
+      if (!applied) {
+        if (vd === 'NEED_CONFIRM') {
+          session.pendingConfirm = { at: Date.now(), i: confirmBtn.i, tid: work.targetId }
+          return {
+            ok: false, category: 'WORLD', error: 'SUBMIT_NEED_CONFIRM',
+            ...base,
+            needConfirm: { i: confirmBtn.i, text: confirmBtn.label || null },
+            changed: '点了「交」，页面弹出一个确认框 —— 还没交上去',
+            hint: '**别重新 hand_submit**（那会重复提交）。照下面点确认框里的按钮：'
+              + `hand_click({ i: ${JSON.stringify(confirmBtn.i)} })`
+              + (confirmBtn.label ? '' : '（它没有文字；i 点不中就 eye_see 看坐标用 { x, y }）'),
+            next: '点完用 eye_see 确认出现"已提交"/分数；出现了就**不要再提交**。',
+          }
+        }
+        return {
+          ok: false, category: 'WORLD', error: 'SUBMIT_UNCONFIRMED',
+          ...base,
+          changed: '点了「交」，但页面没有任何"交上了"的迹象',
+          hint: '没跳页、没分数、也没有"已提交"字样 —— **不能确认交上了**。'
+            + '先 eye_see 看现在是什么页面；**不要重复 hand_submit**。'
+            + '确实交不上就 hand_note({ tag:"pending" }) 交给用户。',
+        }
+      }
+
+      NT.markDone(r.url, 'submit')
+      const out = {
+        ok: true, ...base,
+        changed: click.navigated
+          ? `交完跳到了 ${click.urlAfter}`
+          : (typeof base.score === 'number' ? `交上了（页面报分 ${base.score}）` : '交上了（页面出现"已提交"字样）'),
       }
       if (typeof out.score === 'number' && typeof out.fullScore === 'number' && out.score < out.fullScore) {
         out.scoreGap = out.fullScore - out.score
@@ -1230,9 +1416,8 @@ function applyInner(ctx, config = {}) {
           + '知识点上的错就用 hand_note({ tag:"lesson" }) 记下来。一般不给重做，**不要重复提交**。'
       }
       if (confirmBtn) {
-        out.needConfirm = { i: confirmBtn.i, text: confirmBtn.label }
-        out.hint = '弹出了一个确认框。用 hand_click 点它上面那个按钮：'
-          + `hand_click({ i: ${JSON.stringify(confirmBtn.i)} })。`
+        // 已经交上了还冒出新按钮 → 那是交完才有的（"查看答案"之类），不是确认框
+        out.note = `交完之后页面上多了个按钮「${confirmBtn.label || '无文字'}」—— 那是交完才出现的，不是确认框。`
       }
       return out
     },
@@ -1312,16 +1497,33 @@ function applyInner(ctx, config = {}) {
       '★ **复核员专用**：把你的复核结论登记下来。主脑调它会返回 LEAD_CANNOT_JUDGE（那是对的）。\n'
       + 'picks 的键 = 主脑给你的**编号清单**里的 n（不是题号，是"从上到下第几处"）；'
       + '值 = 图上看得见的标签（"A" / "B" / "对" / "错"）。\n'
-      + '不登记的话，主脑根本交不出去。',
+      + '不登记的话，主脑根本交不出去。\n'
+      + '⚠️ 本工具里出现的任何标签都**只是格式占位**。照抄示例 = 替复核员作答 ——\n'
+      + '那样"三份一致"是伪造的（页面上那份和登记的那份本来就是同一份答案），\n'
+      + '复核形同不存在。你的答案必须是你自己在图上读出来的。',
     parameters: {
       type: 'object',
       properties: {
         picks: {
           type: 'object',
-          description: '{"1":["B"],"2":["对"]} —— 键是「从上到下第几处」，值是图上看得见的标签',
+          description: '{"1":["<标签>"]} —— 键是「从上到下第几处」，值是图上看得见的标签（占位符，务必换成你自己读到的）',
           additionalProperties: { type: 'array', items: { type: 'string' } },
         },
         uncertain: { type: 'array', items: { type: 'number' }, description: '拿不准的那几处编号（**不要猜**）' },
+        needShots: {
+          type: 'array',
+          items: { type: 'number' },
+          description: '★ 看不清、想要主脑补一张特写的那几处编号 n。主脑会在 eye_check 的 wantShots 里看到，'
+            + '用 eye_shot({ i }) 裁那一处发给你，收到后重新登记（顶层写 __need_shot 等价）。',
+        },
+        __need_shot: { type: 'array', items: { type: 'number' }, description: 'needShots 的等价别名' },
+        writes: {
+          type: 'object',
+          description: '{"1":"应该写进去的答案"} —— 键是**写字清单的编号 w**（不是 pick 的 n），值是那条答案的原文。'
+            + '以前填空/简答一个复核员都没看过，页面写什么就是什么；现在你写的会跟页面上实际内容比对。',
+          additionalProperties: { type: 'string' },
+        },
+        uncertainWrites: { type: 'array', items: { type: 'number' }, description: '你不会写 / 拿不准的那几处 w（**不要瞎编**）' },
         round: { type: 'number', description: '第几轮看的（重看之后填 2，可选）' },
         note: { type: 'string', description: '一句话说明（可选）' },
       },
@@ -1329,16 +1531,15 @@ function applyInner(ctx, config = {}) {
       additionalProperties: false,
     },
     isConcurrencySafe: () => true,
-    async run({ picks, uncertain, round, note, needShots }, exec) {
+    async run({ picks, uncertain, round, note, needShots, writes, uncertainWrites }, exec) {
       const work = await getWork()
       const r = await SEE.readAreas(work, { full: false })
       const areas = r.areas ?? []
       noteSig(r)
-      // ★ 和 eye_check / hand_submit 同一个口径（gate.reviewContext）：
-      //   身份 = 全量清单哈希；ignore 从 session 取（eye_check 存的那份，没有就全量复核）。
-      //   bad 按"页面上真实有的"判（复核员手里可能是更早的全量清单，多给不算错），
-      //   missing 按"这一轮要复核的"判 —— 两个集合分开，别混。
-      const rc = GATE.reviewContext(areas, session.ignoreByLh)
+      // ★ 和 eye_check / hand_submit 同一个口径（gate.reviewContext）：身份 = 全量清单哈希，
+      //   ignore 从 session 取（eye_check 存的那份，没有就全量复核）。
+      //   bad 按"页面上真实有的"判，missing 按"这一轮要复核的"判 —— 两个集合分开，别混。
+      const rc = GATE.reviewContext(areas, session.ignoreByLh, undefined, stablePageKey(work, r.url), session.ignoreWriteByLh)
       const lh = rc.lh
       const onPage = new Set(rc.full.map((x) => String(x.n)))
       const required = new Set(rc.ledger.map((x) => String(x.n)))
@@ -1347,7 +1548,8 @@ function applyInner(ctx, config = {}) {
       if (bad.length) {
         return {
           ok: false, category: 'ARG',
-          error: `你登记的编号 ${bad.join('/')} 不在这一页的清单里`,
+          error: `你登记的编号 ${bad.join('/')} 不在这一页的清单里`
+            + `（这一页的编号是 ${[...onPage].join('、') || '（没有）'}）`,
           expected: `这一页上的编号是：${[...onPage].join('、') || '（没有）'}`,
           example: '{"picks":{"1":["B"],"2":["对"]},"uncertain":[3]}',
         }
@@ -1363,11 +1565,26 @@ function applyInner(ctx, config = {}) {
         }
       }
 
+      // ★ 写字处同样要覆盖到：给了答案 / 明说不会写，二选一（缺 Fatal 会像 pick 那样堵住登记）
+      const requiredW = new Set(rc.writeLedger.map((x) => String(x.w)))
+      const missingW = [...requiredW].filter(
+        (k) => !Object.prototype.hasOwnProperty.call(writes ?? {}, k) && !uncertainWrites.includes(Number(k)),
+      )
+      if (missingW.length) {
+        return {
+          ok: false, category: 'USAGE', error: 'REVIEW_INCOMPLETE',
+          missingWrites: missingW.map(Number),
+          expected: `第 ${missingW.join('、')} 处（写字的）你既没给答案、也没说不会写`,
+          hint: '会写的写进 writes（键是写字清单的编号 w，不是 pick 的 n）；'
+            + '不会写的写进 uncertainWrites —— **不要瞎编**。',
+        }
+      }
+
       // ★ 身份由 ctx.agents 判定，**不靠自报** —— 复核员只有一份「当前结论」，重登记整体覆盖
       const judgeId = exec?.agent?.id ?? 'unknown-reviewer'
       session.verdicts[lh] = session.verdicts[lh] ?? {}
       session.verdicts = GATE.recordVerdict(session.verdicts, {
-        ledgerHash: lh, judgeId, picks, uncertain, needShots, round, note,
+        ledgerHash: lh, judgeId, picks, uncertain, needShots, writes, uncertainWrites, round, note,
       })
       session.lastToken = null       // 登记变了 → 旧票据作废（页面指纹里也含 filled，这里再保一道）
 

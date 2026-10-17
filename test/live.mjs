@@ -482,6 +482,26 @@ await t('L8c loginState：frame.html 直接当顶层页 → true（主窗口命�
 // ═══════════════════════════════════════════════════════════════════════════
 // L9 socket 健康层（P0-1）：浏览器死了，调用必须快速失败，不许挂起
 // ═══════════════════════════════════════════════════════════════════════════
+// L2b eye_paper：整卷 1..N + 落盘编号 + 分段（2026-10-17）
+// 做题的子 Agent 不会滚动，必须一次拿到完整题面 —— 这条守住"整卷"这件事。
+await t('L2b eye_paper：题目按 1..N 编好、每题都有落盘编号、至少一段', async () => {
+  await geoGoto(mainUrl)          // 前面的用例把页面导航去了别的 fixture，先回来
+  const r = await call('eye_paper', { shot: false })
+  eq(r.ok, true, `ok 应为 true：${JSON.stringify(r).slice(0, 300)}`)
+  eq(r.total, 4, `fixture 有 4 道题（3 挑 + 1 写），实际 ${r.total}`)
+  eq(r.items.map((x) => x.kind).join(','), 'pick,pick,pick,write')
+  eq(r.items.map((x) => x.n).join(','), '1,2,3,4', '题号必须连续且从上到下')
+  ta(r.items.every((x) => typeof x.i === 'string' && x.i.length > 0), '每题都要有落盘编号 i')
+  ta(r.items[0].options.length === 3 && typeof r.items[0].options[0].i === 'string', '选项也要带落盘编号')
+  ta(Array.isArray(r.segments) && r.segments.length >= 1, '至少一段图')
+  ta(r.segments[0].covers.includes(1), '第一段必须盖住第 1 题')
+  ta(r.clip && r.clip.width > 0 && r.clip.height > 0, '题目区矩形要量出来')
+  // 登记键 = ledger 的 n（write 用 w），必须和 eye_check 同一口径 ——
+  // 3.5 实测踩过：按题号登记，eye_check 读到 registered:0，票据发不出来。
+  eq(r.items.map((x) => x.key).join(','), '1,2,3,1', 'key 应是 ledger 的 n / write 的 w')
+  ta(!('areas' in r), '不要把整页 areas 回传给模型')
+})
+
 await t('L9a 关掉浏览器 → isAlive false、onDead 广播到', async () => {
   eq(geo.sock.isAlive(), true, '之前应是活的')
   let deadInfo = null
@@ -537,12 +557,17 @@ await t('L10b launchBrowser：在 Linux/macOS 上真能起（旧版只认 Window
 })
 
 await t('L10c launchBrowser：DSH_BROWSER_PATH 指错 → 明确报错', async () => {
+  // ★ 必须用一个**全新的端口**，不能复用 L10b 的 cdpPort2：
+  //   launchBrowser 开头先 connectBrowser(port)，端口上只要还有浏览器在听就提前 return、
+  //   永远走不到下面的环境变量校验。L10b 刚 Browser.close 掉同端口的浏览器，进程还没退干净，
+  //   复用端口会让这条用例假失败（产品行为本身是对的，已单独探针验证过）。
+  const port = await freePort()
   const prev = process.env.DSH_BROWSER_PATH
   try {
     process.env.DSH_BROWSER_PATH = join(tmpWork, 'nope-chrome')
     let err = null
     try {
-      await B.launchBrowser({ port: cdpPort2, profileDir: join(tmpWork, 'profile3') })
+      await B.launchBrowser({ port, profileDir: join(tmpWork, 'profile3') })
     } catch (e) { err = e }
     ta(!!err, '应抛错')
     ta(/DSH_BROWSER_PATH/.test(String(err?.message)), `报错应点到环境变量: ${err?.message}`)

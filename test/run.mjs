@@ -1,12 +1,14 @@
 /**
  * test/run.mjs —— 断言集
  *
- * 分六组：
+ * 分七组：
  *   A 参数校验（args.mjs）  —— 格式错必须拦住，且**零副作用**
- *   B 复核闸门（gate.mjs）  —— 七条 + 票据 + 登记覆盖
+ *   B 复核闸门（gate.mjs）  —— 八条 + 票据 + 登记覆盖
  *   C 工具表面             —— 16 个工具、前缀、并发标志
  *   D 痕迹检查             —— 代码/提示词里不许有平台字样
  *   E 预设自检             —— cordis.patch.yml / package.json / 提示词对得上
+ *                              （版本号单一数据源也在 E4b 盯着）
+ *   F 真的装载一次         —— 模拟 DSH 的服务注入
  *   G socket 健康层 + 浏览器发现 —— P0-1 挂起修复 / E-9 跨平台（不需要真浏览器）
  *
  * 另有 test/live.mjs（npm run test:live）：真 chromium 的 fixture 测试台。
@@ -210,6 +212,57 @@ t('A49 hand_verdict: 其它坏键照旧拒（特例只开 __need_shot 一个口�
   eq(A.checkArgs('hand_verdict', { picks: { '0': ['B'] } }).ok, false)
 })
 
+// ── A49-2+：顶层 needShots / __need_shot（2026-10-17 补齐）─────────────────
+// 缺陷：提示词教顶层写法，而白名单里没这个顶层键 → 照抄提示词就被打 ARG，这条闭环
+// 在实际会话里从未被用过（日志实证 0 次）。
+t('A49-2 ★ 提示词教的顶层写法 {"picks":{...},"__need_shot":[3]} 必须能过', () => {
+  const r = A.checkArgs('hand_verdict', { picks: { '1': ['B'] }, __need_shot: [3] })
+  eq(r.ok, true, `顶层 __need_shot 不该被拒：${JSON.stringify(r)}`)
+  eq(JSON.stringify(r.args.needShots), JSON.stringify([3]))
+  eq(JSON.stringify(r.args.picks), JSON.stringify({ '1': ['B'] }), '不该混进 picks')
+})
+t('A49-3 ★ 顶层 needShots 同样能过（结构化写法）', () => {
+  const r = A.checkArgs('hand_verdict', { picks: { '1': ['B'] }, needShots: [2] })
+  eq(r.ok, true, JSON.stringify(r))
+  eq(JSON.stringify(r.args.needShots), JSON.stringify([2]))
+})
+t('A49-4 三种写法混着给 → 归一化去重，不重复', () => {
+  const r = A.checkArgs('hand_verdict', { picks: { '1': ['B'], __need_shot: [2] }, needShots: [2, 3], __need_shot: [3, 4] })
+  eq(r.ok, true, JSON.stringify(r))
+  eq(JSON.stringify(r.args.needShots), JSON.stringify([2, 3, 4]), '去重后')
+})
+t('A49-5 顶层写法值不合法 → 照旧 ARG', () => {
+  eq(A.checkArgs('hand_verdict', { picks: { '1': ['B'] }, needShots: ['x'] }).ok, false)
+  eq(A.checkArgs('hand_verdict', { picks: { '1': ['B'] }, __need_shot: 3 }).ok, false)
+  eq(A.checkArgs('hand_verdict', { picks: { '1': ['B'] }, needShots: [0] }).ok, false)
+})
+
+// ── A49-6+：写字区（填空 / 简答）登记 + ignoreWrite（2026-10-17）─────────────
+t('A49-6 hand_verdict: writes 正常登记', () => {
+  const r = A.checkArgs('hand_verdict', { picks: { '1': ['<标签>'] }, writes: { '1': '生产力决定生产关系' } })
+  eq(r.ok, true, JSON.stringify(r))
+  eq(r.args.writes['1'], '生产力决定生产关系')
+})
+t('A49-7 hand_verdict: writes 键不是正整数 / 值是空的 → ARG', () => {
+  eq(A.checkArgs('hand_verdict', { picks: { '1': ['<标签>'] }, writes: { a: 'x' } }).ok, false)
+  eq(A.checkArgs('hand_verdict', { picks: { '1': ['<标签>'] }, writes: { '1': '   ' } }).ok, false)
+  eq(A.checkArgs('hand_verdict', { picks: { '1': ['<标签>'] }, writes: [] }).ok, false)
+})
+t('A49-8 hand_verdict: uncertainWrites 非法 → ARG；合法 → 通过', () => {
+  const ok = A.checkArgs('hand_verdict', { picks: { '1': ['<标签>'] }, uncertainWrites: [2] })
+  eq(ok.ok, true, JSON.stringify(ok))
+  eq(JSON.stringify(ok.args.uncertainWrites), JSON.stringify([2]))
+  eq(A.checkArgs('hand_verdict', { picks: { '1': ['<标签>'] }, uncertainWrites: [0] }).ok, false)
+  eq(A.checkArgs('hand_verdict', { picks: { '1': ['<标签>'] }, uncertainWrites: '2' }).ok, false)
+})
+t('A49-9 ★ eye_check: ignoreWrite 必须能过（否则搜索框永远拦住提交）', () => {
+  const r = A.checkArgs('eye_check', { ignoreWrite: [1] })
+  eq(r.ok, true, JSON.stringify(r))
+  eq(JSON.stringify(r.args.ignoreWrite), JSON.stringify([1]))
+  eq(A.checkArgs('eye_check', { ignoreWrite: [0] }).ok, false)
+  eq(A.checkArgs('eye_check', { ignoreWrite: '1' }).ok, false)
+})
+
 // ── A50+：eye_shot 省图三参数（改进）──────────────────────────────────────
 t('A50 eye_shot: i / embed / force 受支持', () => {
   const r = A.checkArgs('eye_shot', { i: 'r7k2p1:3', embed: false, force: true })
@@ -324,9 +377,178 @@ t('B5 没变就不变（滚动/截图不该作废票据）', () => {
   eq(a, b)
 })
 t('B6 换一套题 → 清单指纹变（常驻复核员不串题）', () => {
-  const a = G.ledgerHash(G.buildLedger(AREAS))
-  const b = G.ledgerHash(G.buildLedger([areaPick('r9', 4, ['B']), AREAS[1], areaPick('r8', 2, ['A'])]))
-  ta('B6b 不一样', a !== b)
+  // ⚠️ 身份不再由元素编号 `i` 承担（那是每次扫描随机的），改由 pageKey + 结构承担
+  const setA = [areaPick('r1', 4, ['B']), AREAS[1], areaPick('r3', 2, ['A'])]
+  const setB = [areaPick('r9', 4, ['B']), AREAS[1], areaPick('r8', 2, ['A'])]
+  const b = G.ledgerHash(G.buildLedger(setB), 'T|/quiz/2')   // 另一套题＝另一个页面标识
+  ta('B6b 不一样', G.ledgerHash(G.buildLedger(setA), 'T|/quiz/1') !== b)
+})
+
+// ── B34–B36：P0-1 回归（2026-10-17）──────────────────────────────────────
+// 缺陷：元素编号每次扫描随机，早先混进了 ledgerHash / pageFingerprint → 同一页扫两遍
+// 算出两个身份 → 登记恒读不到、票据恒 null、submit 恒 STALE_TOKEN。详见 CHANGELOG 2.3.0。
+const rescan = (seed) => [areaPick(`${seed}1`, 4, ['B']), AREAS[1], areaPick(`${seed}3`, 2, ['A'])]
+
+t('B34 ★ 同一页重扫一遍（编号全部随机重生成）→ 题目身份不变', () => {
+  eq(
+    G.ledgerHash(G.buildLedger(rescan('r')), 'T|/quiz/1'),
+    G.ledgerHash(G.buildLedger(rescan('rzx98k')), 'T|/quiz/1'),
+    '同一页两次扫描的身份',
+  )
+})
+t('B35 ★ 同一页重扫一遍 → 页面指纹也不变（否则票据恒 STALE_TOKEN）', () => {
+  eq(
+    G.pageFingerprint({ targetId: 'T', url: 'u', areas: rescan('r') }),
+    G.pageFingerprint({ targetId: 'T', url: 'u', areas: rescan('rqq94ro') }),
+    '重扫后的指纹',
+  )
+})
+t('B36 ★ 缺陷复现：两个复核员各自扫一遍登记 → 主脑再扫一遍仍能凑够两份并验票通过', () => {
+  const page = 'T|/quiz/1'
+  // 主脑：eye_check（第 1 次扫描）
+  const rc = G.reviewContext(rescan('r'), {}, undefined, page)
+  const fp = G.pageFingerprint({ targetId: 'T', url: 'u', areas: rescan('r') })
+  const store = { [rc.lh]: rc.ignore }
+  // 两个复核员：各自独立扫描（编号各不相同）后登记
+  let verdicts = {}
+  for (const [gid, seed] of [['g1', 'raa111'], ['g2', 'rbb222']]) {
+    const rv = G.reviewContext(rescan(seed), store, undefined, page)
+    verdicts = G.recordVerdict(verdicts, { ledgerHash: rv.lh, judgeId: gid, picks: { 1: ['B'], 2: ['A'] } })
+  }
+  // 主脑第 3 次扫描时必须读得到这两份
+  const entries = Object.entries(verdicts[rc.lh] ?? {}).map(([id, v]) => ({ id, ...v }))
+  eq(entries.length, 2, '登记份数')
+  const gate = G.checkGate({ areas: rescan('r'), ledger: rc.ledger, entries, ignore: rc.ignore })
+  eq(gate.verdict, 'PASS', '走查结论')
+  const token = G.makeToken({ fingerprint: fp, ledgerHash: rc.lh, gate })
+  ta('B36b 拿到票据', !!token)
+  // hand_submit：又一次全新扫描，票据必须仍然有效
+  const sm = G.reviewContext(rescan('rcc333'), store, undefined, page)
+  const fp2 = G.pageFingerprint({ targetId: 'T', url: 'u', areas: rescan('rcc333') })
+  eq(G.verifyToken(token, { fingerprint: fp2, ledgerHash: sm.lh }).ok, true, '验票')
+})
+
+// ── B37–B44：写字区（填空 / 简答）2026-10-17 ───────────────────────────────
+// 缺陷：任何输入框都被当成待答填空题且无法排除（实测里主脑往搜索框写 "x" 骗过检查）；
+// 同时写字区的答案内容没有任何复核员看过。详见 CHANGELOG 2.3.0。
+const W_AREAS = [
+  areaPick('r1', 4, ['B']),
+  areaWrite('search', ''),                                   // ← 右上角搜索框，不是题
+  areaWrite('r2', '社会存在决定社会意识'),
+]
+const W_JUDGES = (text) => ([
+  { id: 'grader-1-xxxx', picks: { 1: ['B'] }, uncertain: [], writes: { 2: text } },
+  { id: 'grader-2-yyyy', picks: { 1: ['B'] }, uncertain: [], writes: { 2: text } },
+])
+const gateWrite = ({ areas = W_AREAS, ignoreWrite = [], entries = [] } = {}) => {
+  const ledger = G.buildLedger(areas)
+  const writeLedger = G.buildWriteLedger(areas, ignoreWrite)
+  return G.checkGate({ areas, ledger, writeLedger, ignoreWrite, entries })
+}
+
+t('B37 写字区编号 w 是独立的一套，ignoreWrite 不改变编号（同 n 的道理）', () => {
+  eq(G.buildWriteLedger(W_AREAS).length, 2)
+  eq(G.buildWriteLedger(W_AREAS).map((x) => x.w).join(), '1,2')
+  const skipped = G.buildWriteLedger(W_AREAS, [1])
+  eq(skipped.length, 1)
+  eq(skipped[0].w, 2, '编号仍是全量口径的 w')
+})
+t('B38 ★ 搜索框场景：ignoreWrite:[1] 之后 EMPTY_WRITE 消失', () => {
+  eq(gateWrite({ entries: W_JUDGES('社会存在决定社会意识') }).verdict, 'EMPTY_WRITE')
+  eq(gateWrite({ ignoreWrite: [1], entries: W_JUDGES('社会存在决定社会意识') }).verdict, 'PASS')
+})
+t('B39 ★ 填空答案三方一致 → 放行', () => {
+  const g = gateWrite({ ignoreWrite: [1], entries: W_JUDGES('社会存在决定社会意识') })
+  eq(g.verdict, 'PASS', JSON.stringify(g.problems))
+  eq(g.writes.agree.length, 1)
+})
+t('B40 ★ 页面上写串了 → WRITE_DISSENT（以前这一层完全睁眼瞎）', () => {
+  const g = gateWrite({ ignoreWrite: [1], entries: W_JUDGES('社会意识决定社会存在') })
+  eq(g.verdict, 'WRITE_DISSENT')
+  ta('B40b 说清是哪一处', g.problems.some((p) => p.w === 2), JSON.stringify(g.problems))
+})
+t('B41 两个复核员互相不一样 → 也判 WRITE_DISSENT', () => {
+  const entries = [
+    { id: 'grader-1-xxxx', picks: { 1: ['B'] }, uncertain: [], writes: { 2: '甲答案' } },
+    { id: 'grader-2-yyyy', picks: { 1: ['B'] }, uncertain: [], writes: { 2: '乙答案' } },
+  ]
+  eq(gateWrite({ ignoreWrite: [1], entries }).verdict, 'WRITE_DISSENT')
+})
+t('B42 明确说不会写 → 不算不一致（不能逼复核员瞎编）', () => {
+  const entries = [
+    { id: 'grader-1-xxxx', picks: { 1: ['B'] }, uncertain: [], writes: {}, uncertainWrites: [2] },
+    { id: 'grader-2-yyyy', picks: { 1: ['B'] }, uncertain: [], writes: {}, uncertainWrites: [2] },
+  ]
+  eq(gateWrite({ ignoreWrite: [1], entries }).verdict, 'PASS')
+})
+t('B43 一处都没人登记 → 不制造假分歧（宁可放过，不可堵死）', () => {
+  const entries = [
+    { id: 'grader-1-xxxx', picks: { 1: ['B'] }, uncertain: [], writes: null },
+    { id: 'grader-2-yyyy', picks: { 1: ['B'] }, uncertain: [], writes: null },
+  ]
+  const g = gateWrite({ ignoreWrite: [1], entries })
+  eq(g.verdict, 'PASS')
+  eq(g.writes.dissent.length, 0)
+})
+t('B44 normText 只做肉眼等价的归一，不做语义改写', () => {
+  eq(G.normText('  社会存在决定社会意识  '), '社会存在决定社会意识')
+  eq(G.normText('社会存在决定社会意识。'), '社会存在决定社会意识')
+  eq(G.normText('ａｂｃ'), 'abc')
+  ta('B44b 不同的答案还是不同的', G.normText('甲答案') !== G.normText('乙答案'))
+})
+
+// ── B45–B52：动完手之后"到底成没成"（2026-10-17 真机）──────────────────────
+// 判断题点了没反应也报 ok:true、提交没生效也说"交了" —— 这两处假成功让模型反复重试到烧完预算。
+
+t('B45 pickOutcome：要挑的每一处都真选中了才算成功', () => {
+  const v = G.pickOutcome({ picked: [{ label: 'B', now: true }, { label: 'C', now: true }], areaState: { selected: 2, total: 4 } })
+  eq(v.ok, true)
+  eq(v.code, null)
+})
+t('B46 ★ pickOutcome：点了但没选中 → PICK_NOT_APPLIED（不再假成功）', () => {
+  const v = G.pickOutcome({ picked: [{ label: 'B', now: false }], areaState: { selected: 0, total: 2 } })
+  eq(v.ok, false)
+  eq(v.code, 'PICK_NOT_APPLIED')
+  eq(v.miss.map((p) => p.label).join(','), 'B')
+})
+t('B47 pickOutcome：参数不合格 → PICK_REJECTED（整批没动）', () => {
+  const v = G.pickOutcome({ picked: [], rejected: [{ given: 'Z', reason: '页面没有' }], areaState: { selected: 0, total: 2 } })
+  eq(v.ok, false)
+  eq(v.code, 'PICK_REJECTED')
+})
+t('B48 pickOutcome：clear 没清干净也算没做成', () => {
+  eq(G.pickOutcome({ picked: [], areaState: { selected: 1, total: 2 }, mode: 'clear' }).code, 'PICK_NOT_APPLIED')
+  eq(G.pickOutcome({ picked: [], areaState: { selected: 0, total: 2 }, mode: 'clear' }).ok, true)
+})
+t('B49 submitOutcome：跳页 / 分数 / 页面说"已提交" 都算交上了', () => {
+  eq(G.submitOutcome({ navigated: true }), 'APPLIED')
+  eq(G.submitOutcome({ score: 87 }), 'APPLIED')
+  eq(G.submitOutcome({ text: '作业已提交，等待批阅' }), 'APPLIED')
+  eq(G.submitOutcome({ text: '提交成功' }), 'APPLIED')
+})
+t('B50 ★ submitOutcome：什么都没变 → 不算交上（有确认框单独报）', () => {
+  eq(G.submitOutcome({ navigated: false, text: '待完成' }), 'UNCONFIRMED')
+  eq(G.submitOutcome({ navigated: false, text: '', hasConfirm: true }), 'NEED_CONFIRM')
+})
+t('B51 submitOutcome：别把"未提交 / 已完成 N 个 / 查看答案"当成交上了', () => {
+  eq(G.submitOutcome({ text: '本章未提交' }), 'UNCONFIRMED')
+  eq(G.submitOutcome({ text: '已完成 3 个任务点' }), 'UNCONFIRMED')
+  eq(G.submitOutcome({ text: '查看答案' }), 'UNCONFIRMED')
+})
+t('B52 ★ 两处假成功的现场：判定必须走 gate 的纯函数', () => {
+  const src = read('index.js')
+  ta('B52a hand_pick 用 pickOutcome', /pickOutcome\(/.test(src))
+  ta('B52b hand_submit 用 submitOutcome', /submitOutcome\(/.test(src))
+  ta('B52c 确认框一次性放行通道还在', /pendingConfirm/.test(src))
+})
+t('B53 ★ 按文字定位：能退到叶子元素，且拒绝"一大块里恰好有这两个字"', () => {
+  // 2026-10-17 真机：hand_click({text:"错"}) 在 iframe 里找不到判断题选项，
+  // 却命中了主页面的章节链接 → 点下去整页跳到别的章节。
+  const h = read('lib/hand.mjs')
+  ta('B53a 有叶子回退（li/span/div…）', /const WIDE = 'li,span,div,td,p/.test(h))
+  ta('B53b 有文本长度上限', /want\.length \* 3 \+ 12/.test(h))
+  ta('B53c 多个候选仍然报歧义，不猜', /ambiguous: outer\.length/.test(h))
+  ta('B53d 眼睛那一侧同样有长度上限', /t\.length <= want\.length \* 3 \+ 12/.test(read('lib/see.mjs')))
 })
 
 t('B7 标签归一化', () => {
@@ -336,6 +558,24 @@ t('B7 标签归一化', () => {
   eq(G.normLabel(' 对 '), '对')
 })
 t('B8 集合比对不看顺序', () => ta('B8b', G.samePick(['B', 'C'], ['C', 'B'])))
+
+// ── B8-2+：判断题标签「字母+词」与其中一半的写法差异（2026-10-17 真机回归）───
+//
+// 缺陷：判断题选项在 DOM 里的标签是连起来读的（"A对" / "B错"），而看图的人只会报
+// 其中一个（"A" 或 "对"）。真机日志：三道题全答对，却因为
+// 「你:A对，复核员:A，复核员:对」被判 REVIEWERS_DISSENT，票据发不出来、交不出去。
+t('B8-2 ★ 页面的"A对"要能匹配复核员的"A"和"对"', () => {
+  ta('B8-2b 匹配字母', G.sameAnswer('A对', 'A'))
+  ta('B8-2c 匹配词', G.sameAnswer('A对', '对'))
+  ta('B8-2d 集合也认', G.samePick(['A对'], ['A']) && G.samePick(['A对'], ['对']))
+  ta('B8-2e 归一化后仍成立', G.sameAnswer('ａ对', 'A') && G.sameAnswer('A对', '对。'))
+})
+t('B8-3 ★ 但不能因此把错的当成对的', () => {
+  ta('B8-3b A对 ≠ B', !G.sameAnswer('A对', 'B'))
+  ta('B8-3c A对 ≠ 错', !G.sameAnswer('A对', '错'))
+  ta('B8-3d 集合不塌', !G.samePick(['A对'], ['A', 'B']))
+  ta('B8-3e 普通单选不受影响', G.samePick(['B'], ['B']) && !G.samePick(['B'], ['C']))
+})
 
 t('B9 同一个复核员重登记 → 覆盖，不算两个人', () => {
   let store = {}
@@ -539,21 +779,21 @@ t('B33 跳到新页面不报确认框（新页的按钮是它自己的）', () =
 const IDX = read('index.js')
 const TOOLS = [...IDX.matchAll(/name:\s*'(eye_[a-z]+|hand_[a-z]+)'/g)].map((m) => m[1])
 
-t('C1 一共 16 个工具', () => eq(TOOLS.length, 16, `实际 ${TOOLS.length}：${TOOLS.join(',')}`))
+t('C1 一共 17 个工具', () => eq(TOOLS.length, 17, `实际 ${TOOLS.length}：${TOOLS.join(',')}`))
 t('C1b README 工具表对得上（修文档漂移：旧 README 写"15 个工具"、漏了 hand_read）', () => {
   const readme = read('README.md')
   for (const n of TOOLS) ta(`C1c README 提到 ${n}`, readme.includes(n))
-  ta('C1d README 写 16 个工具', /16 个工具/.test(readme))
+  ta('C1d README 写 17 个工具', /17 个工具/.test(readme))
 })
 t('C1e install.ps1 收尾模式名不是旧名（Wangke）', () => {
   const ps1 = read('install.ps1')
   ta('C1f 没有旧模式名', !/Wangke/.test(ps1))
   ta('C1g 写了网课模式', /网课模式/.test(ps1))
 })
-t('C2 眼 5 个', () => {
+t('C2 眼 6 个', () => {
   const eyes = TOOLS.filter((x) => x.startsWith('eye_'))
-  eq(eyes.length, 5, eyes.join(','))
-  for (const n of ['eye_open', 'eye_see', 'eye_list', 'eye_shot', 'eye_check']) ta(`C2b ${n}`, eyes.includes(n))
+  eq(eyes.length, 6, eyes.join(','))
+  for (const n of ['eye_open', 'eye_see', 'eye_paper', 'eye_list', 'eye_shot', 'eye_check']) ta(`C2b ${n}`, eyes.includes(n))
 })
 t('C3 手 11 个', () => {
   const hands = TOOLS.filter((x) => x.startsWith('hand_'))
@@ -564,7 +804,7 @@ t('C3 手 11 个', () => {
 t('C4 不许再有旧前缀', () => ta('C4b', !/\bcx_[a-z]/.test(IDX)))
 t('C5 并发标志：只读的是 true，会动手的是 false', () => {
   // 判断标准：**会不会动页面**。只读（眼 + 笔记 + 登记）可以并发；动手的必须串行。
-  const READONLY = new Set(['eye_open', 'eye_see', 'eye_list', 'eye_shot', 'eye_check', 'hand_note', 'hand_verdict'])
+  const READONLY = new Set(['eye_open', 'eye_see', 'eye_paper', 'eye_list', 'eye_shot', 'eye_check', 'hand_note', 'hand_verdict'])
   const blocks = IDX.split(/reg\(\{/).slice(1)
   for (const b of blocks) {
     const nm = /name:\s*'([a-z_]+)'/.exec(b)?.[1]
@@ -721,10 +961,18 @@ t('E3g 提示词要告诉模型"适时收口，给用户压缩机会"', () => {
 })
 t('E4 package.json 对得上', () => {
   eq(PKG.name, 'dsh-xuexi')
-  eq(PKG.version, '2.2.4')
   eq(PKG.dsh.id, 'dsh-xuexi')
   eq(PKG.dsh.repo, 'LeuJasYoh/dsh-xuexi')
   eq(PKG.dsh.name, '网课模式')
+})
+// ★ 版本号单一数据源（2026-10-17）：真源只有 package.json 的 version，其余三处由
+//   scripts/sync-version.mjs 同步。以前这里硬编码版本号，"忘了同步"要分两次才抓得到。
+t('E4b ★ 版本单一数据源：package.json.version 是唯一真源，其余三处必须等于它', () => {
+  eq(PKG.dsh.version, PKG.version, 'package.json 的 dsh.version 与 version 不一致')
+  const readmeVer = /^\*\*当前版本 (.+?)\*\*/m.exec(read('README.md'))?.[1]
+  eq(readmeVer, PKG.version, 'README.md 顶部的版本号与 package.json 不一致')
+  const clVer = /^## \[(.+?)\] — /m.exec(read('CHANGELOG.md'))?.[1]
+  eq(clVer, PKG.version, 'CHANGELOG.md 最新段的版本号与 package.json 不一致')
 })
 t('E5 插件导出 name/apply/inject', () => {
   ta('E5b 有 apply', /export\s+function\s+apply/.test(IDX))
@@ -736,10 +984,10 @@ t('E5 插件导出 name/apply/inject', () => {
     /export\s+const\s+inject\s*=\s*\[[^\]]*['"]tools['"][^\]]*\]/.test(IDX),
     "缺 export const inject = ['tools'] —— 整个插件会加载失败")
 })
-t('E6 提示词提到全部 16 个工具（模型得知道怎么调）', () => {
+t('E6 提示词提到全部 17 个工具（模型得知道怎么调）', () => {
   for (const n of TOOLS) ta(`E6b ${n}`, PROMPT.includes(n))
 })
-t('E7 提示词里有"复核员专用"分流', () => ta('E7b', /复核员专用/.test(PROMPT)))
+t('E7 提示词里有"α / β 专用"分流', () => ta('E7b', /α \/ β 专用/.test(PROMPT)))
 t('E8 提示词里有四类错误说明', () => {
   for (const c of ['ARG', 'USAGE', 'WORLD', 'TOOL']) ta(`E8b ${c}`, PROMPT.includes(c))
 })
@@ -820,7 +1068,7 @@ t('E12 铁律六条还在', () => {
       await plugin.apply(ctx, {})
       ta('F1 装载成功（apply 没抛）', true)
       const names = registered.map((d) => d.name)
-      ta('F2 注册了 16 个工具', registered.length === 16, `实际 ${registered.length}：${names.join(',')}`)
+      ta('F2 注册了 17 个工具', registered.length === 17, `实际 ${registered.length}：${names.join(',')}`)
       for (const n of TOOLS) ta(`F3 ${n} 真的注册上了`, names.includes(n))
       for (const d of registered) walkSchema(d.parameters, `${d.name}.parameters`)
       ta('F4 参数 schema 都写全了（object 有 properties、array 有 items）', bad.length === 0,
